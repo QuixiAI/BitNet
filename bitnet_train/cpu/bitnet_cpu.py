@@ -63,6 +63,8 @@ _lib.bn_gemv_tl1_scalar.argtypes = [_u8, _i64, _i64, _i8, C.c_float, C.c_int, _f
 for _n in ("bn_gemv_tl1", "bn_gemv_tl1_neon"):
     if hasattr(_lib, _n):
         getattr(_lib, _n).argtypes = [_u8, _i64, _i64, _i8, C.c_float, C.c_int, _f32, _i8]
+_lib.bn_expert_ffn_tl1.argtypes = [_f32, _i64, _i64, _u8, _u8, _u8, C.c_int, C.c_float,
+                                   _i8, _i8, _f32, _f32, _f32, _i8, _f32]
 
 
 def act_quant_int8(x: np.ndarray):
@@ -284,4 +286,23 @@ def gemv_tl1(wt: np.ndarray, xq: np.ndarray, a_scale: float, pt: bool = False,
         lut_scratch = np.empty(K // 2 * 32, np.int8)
     fn = {"auto": _lib.bn_gemv_tl1, "neon": getattr(_lib, "bn_gemv_tl1_neon", None)}[impl]
     fn(flat, N, K, xq, float(a_scale), int(pt), out, lut_scratch)
+    return out
+
+
+def expert_ffn_tl1(x, gate_wt, up_wt, down_wt, w_r=1.0, pt=False, out=None):
+    """One expert's fused decode FFN on the TL1 format (the ~2x bakeoff winner).
+    *_wt: (rows/16, K/32, 160) tiles from pack_tl1. x (H,) f32 -> out (H,)."""
+    H = x.shape[-1]
+    I = gate_wt.shape[0] * 16
+    out = np.zeros(H, np.float32) if out is None else out
+    xq = np.empty(H, np.int8)
+    hq = np.empty(I, np.int8)
+    g = np.empty(I, np.float32); u = np.empty(I, np.float32)
+    h = np.empty(max(I, H), np.float32)
+    lut = np.empty(max(H, I) // 2 * 32, np.int8)
+    _lib.bn_expert_ffn_tl1(np.ascontiguousarray(x, np.float32), H, I,
+                           np.ascontiguousarray(gate_wt).reshape(-1),
+                           np.ascontiguousarray(up_wt).reshape(-1),
+                           np.ascontiguousarray(down_wt).reshape(-1),
+                           int(pt), float(w_r), xq, hq, g, u, h, lut, out)
     return out

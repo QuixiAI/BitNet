@@ -70,6 +70,7 @@ class BitExperts(nn.Module):
         self.act_fn = experts_mod.act_fn
         self.granularity, self.group_k = granularity, group_k
         self.act_quant = True
+        self.lam = 1.0                               # A3/Q-A3 ramp (see set_lambda)
         gu, dn = experts_mod.gate_up_proj, experts_mod.down_proj
         self.intermediate = gu.shape[1] // 2
         self.gate_up_proj = nn.Parameter(gu.detach().float().clone())
@@ -77,7 +78,7 @@ class BitExperts(nn.Module):
 
     def _fq(self, w2d: torch.Tensor) -> torch.Tensor:
         wq = quant.weight_quant(w2d, self.granularity, self.group_k)
-        return w2d + (wq - w2d).detach()             # STE on the latent slice
+        return w2d + self.lam * (wq - w2d).detach()  # STE on the latent slice (+A3 ramp)
 
     def _aq(self, x: torch.Tensor) -> torch.Tensor:
         if not self.act_quant:
@@ -167,6 +168,17 @@ def set_eval_mode(model: nn.Module, mode: str,
                                           for p in mod.parametrizations.weight):
             parametrize.remove_parametrizations(mod, "weight", leave_parametrized=False)
     return model
+
+
+def set_lambda(model: nn.Module, lam: float) -> None:
+    """A3/Q-A3 one-flag stability ramp: w_eff = (1-lam)*w + lam*quant(w) on every
+    ternary module. Ramp 0 -> 1 over warmup only if step-0 spikes (train_plan §9.1);
+    lam = 1 (default) is the plain quantized forward."""
+    lam = float(min(max(lam, 0.0), 1.0))
+    for _, mod in iter_bitlinears(model):
+        mod.lam = lam
+    for _, mod in iter_bitexperts(model):
+        mod.lam = lam
 
 
 # ---------------------------------------------------------------------------

@@ -302,9 +302,16 @@ def build_argparser(here: Path) -> argparse.ArgumentParser:
                          "tests/test_decay_mask.py is green under the real wrapping "
                          "(moe §5.2 fallback ordering)")
     ap.add_argument("--max-grad-norm", type=float, default=1.0)
+    ap.add_argument("--lambda-ramp-steps", type=int, default=0,
+                    help="A3/Q-A3: ramp quantization in over N steps (0 = off, lam=1 "
+                         "from step 0). Enable only on step-0 spikes (§9.1)")
     ap.add_argument("--mixed-precision", default="no", choices=["no", "bf16", "fp16"])
     ap.add_argument("--grad-checkpointing", action=argparse.BooleanOptionalAction,
                     default=True)
+    ap.add_argument("--latent-dtype", default="fp32", choices=["fp32", "bf16"],
+                    help="§5.4: fp32 baseline (A1) or bf16 latents + fp32 masters (hatch)")
+    ap.add_argument("--moments-bits", type=int, default=32, choices=[32, 8],
+                    help="§5.4: 8 = blockwise-quantized Adam moments (memory hatch)")
     # distillation (§5.1)
     ap.add_argument("--kd", default="dense", choices=["none", "dense", "topk"])
     ap.add_argument("--kd-alpha", type=float, default=1.0)
@@ -385,8 +392,9 @@ def main(argv=None):
     if args.init is None:
         raise SystemExit("--init is required (run train/init_from_base.py first)")
     ckpt = args.resume or args.init
+    latent_dtype = torch.bfloat16 if args.latent_dtype == "bf16" else torch.float32
     model, conv_report = load_converted(ckpt, profile, backend=backend,
-                                        dtype=torch.float32)     # fp32 latents (§5.4)
+                                        dtype=latent_dtype)      # §5.4: fp32 baseline / bf16 hatch
     if args.grad_checkpointing:
         try:
             model.gradient_checkpointing_enable()
@@ -396,6 +404,7 @@ def main(argv=None):
 
     # ---- MoE plumbing (profile-gated)
     router_hooks = masker = None
+    teacher_routing = None
     is_moe = bool(profile.expert_stack_regexes) and any(iter_bitexperts(model))
     if is_moe:
         from bitnet_train.moe_metrics import RouterHooks
@@ -420,7 +429,12 @@ def main(argv=None):
     for g in groups:
         if g.get("decay_masked"):
             g["weight_decay"] = 0.0            # masker owns expert decay (§5.2 ordering)
-    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8)
+    if args.latent_dtype == "bf16" or args.moments_bits == 8:
+        from bitnet_train.optim import MasterAdamW
+        optimizer = MasterAdamW(groups, betas=(0.9, 0.95), eps=1e-8,
+                                moments_bits=args.moments_bits)   # fp32 masters + opt hatches
+    else:
+        optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.95), eps=1e-8)
     if is_moe and profile.decay_masking:
         from bitnet_train.optim import ColdExpertDecayMasker
         masker = ColdExpertDecayMasker(model, optimizer, args.expert_weight_decay)
@@ -505,6 +519,11 @@ def main(argv=None):
     head_w = raw_model.get_output_embeddings().weight
     train_mode = "a1" if is_moe else "w_a8"
     aux_coef = float(getattr(raw_model.config, "router_aux_loss_coef", 0.0) or 0.0)
+    if is_moe and teacher is not None and accelerator.is_main_process:
+        from bitnet_train.moe_metrics import capture_teacher_routing
+        teacher_routing = capture_teacher_routing(
+            teacher.model, calib.to(accelerator.device), accelerator.device,
+            raw_model.config.num_experts_per_tok)     # Q-T0 §8.1 fixture
     code_snapshot = snapshot_codes(raw_model) if accelerator.is_main_process else None
     t0, tokens0 = time.time(), tokens_seen
     model.train()
@@ -536,10 +555,14 @@ def main(argv=None):
         return {"loss": float(loss.detach()), "ce": float(parts["ce"]),
                 "kd": float(parts["kd"]), "aux": aux_val}
 
+    from bitnet_train.bitlinear import set_lambda
+
     for step in range(start_step, total_steps):
         scale = lr_scale(step, args.warmup_steps, total_steps)
         for g, base in zip(optimizer.param_groups, base_lrs):
             g["lr"] = base * scale
+        if args.lambda_ramp_steps:
+            set_lambda(raw_model, (step + 1) / args.lambda_ramp_steps)
 
         step_metrics = None
         for _ in range(args.grad_accum):
@@ -596,7 +619,7 @@ def main(argv=None):
 
         if (step + 1) % args.eval_every == 0 or step + 1 == total_steps:
             ev = run_eval(model, raw_model, profile, calib, accelerator, teacher,
-                          args, is_moe, router_hooks, train_mode)
+                          args, is_moe, router_hooks, train_mode, teacher_routing)
             if accelerator.is_main_process:
                 new_snap = snapshot_codes(raw_model)
                 flips = code_flip_rates(code_snapshot, new_snap)
@@ -645,9 +668,10 @@ def main(argv=None):
 
 @torch.no_grad()
 def run_eval(model, raw_model, profile, calib, accelerator, teacher, args, is_moe,
-             router_hooks, train_mode):
+             router_hooks, train_mode, teacher_routing=None):
     """Both eval modes + KL_tf on the FIXED calibration windows (§8.4/§6.3: both
-    modes at every eval, alarm on trend) + the router panel."""
+    modes at every eval, alarm on trend) + the router panel + per-layer top-8
+    teacher-routing agreement (moe §6.2)."""
     model.eval()
     device = accelerator.device
     ev = {}
@@ -671,6 +695,15 @@ def run_eval(model, raw_model, profile, calib, accelerator, teacher, args, is_mo
     set_eval_mode(raw_model, train_mode)
     if router_hooks is not None:
         router_hooks.stats_and_reset()                            # drop eval-pass stats
+        if teacher_routing is not None:                           # §6.2 agreement pass
+            router_hooks.capture_routing = True
+            raw_model(calib.to(device))
+            router_hooks.capture_routing = False
+            agree = router_hooks.agreement_vs_teacher(teacher_routing)
+            ev["router/top8_agreement"] = agree["_mean"]
+            for i, a in enumerate(agree["_by_depth"]):
+                ev[f"router/agree_L{i}"] = a
+            router_hooks.stats_and_reset()
         router_hooks.collect_aux = profile.aux_loss
     return ev
 

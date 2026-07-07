@@ -104,6 +104,22 @@ def test_expert_ffn(pt):
     np.testing.assert_allclose(y, ref, rtol=5e-4, atol=5e-4)
 
 
+@pytest.mark.parametrize("pt", [False, True])
+def test_expert_ffn_tl1_matches_format_a(pt):
+    """The bakeoff-winner FFN (formats_bakeoff.md follow-up) must equal the
+    format-A fused FFN — same packed source, TL1 tiles vs 2-bit blocks. I,H %16."""
+    H, I = 128, 96
+    Wg = rng.standard_normal((I, H)).astype(np.float32) * 0.1
+    Wu = rng.standard_normal((I, H)).astype(np.float32) * 0.1
+    Wd = rng.standard_normal((H, I)).astype(np.float32) * 0.1
+    gq, _ = pack_bitnet(Wg, pt); uq, _ = pack_bitnet(Wu, pt); dq, _ = pack_bitnet(Wd, pt)
+    x = rng.standard_normal(H).astype(np.float32) * 0.5
+    ref = bn.expert_ffn_w2a8(x, gq, uq, dq, w_r=0.7, pt=pt)
+    y = bn.expert_ffn_tl1(x, bn.pack_tl1(gq), bn.pack_tl1(uq), bn.pack_tl1(dq),
+                          w_r=0.7, pt=pt)
+    np.testing.assert_allclose(y, ref, rtol=1e-5, atol=1e-5)
+
+
 def test_moe_ffn_matches_expert_loop():
     H, I, E, k = 128, 96, 8, 2
     stacks = []

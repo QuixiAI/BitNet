@@ -163,8 +163,14 @@ def export_i2s(baked_dir: str | Path, out_gguf: str | Path,
                             reason=f"fork submodule not initialized at {fork} "
                                    "(git submodule update --init --recursive)")
     if quantize is None:
+        # the fork build needs a model-specific bitnet-lut-kernels.h from the
+        # repo's TL1/TL2 codegen (docs/codegen.md); setup_env.py runs the codegen
+        # + build for a chosen model at T0. The parity DECODER (compare_gguf.
+        # decode_i2s) does not need the binary and is always available.
         return ExportResult("i2s_bitnet_cpp", ok=False, skipped=True,
-                            reason=f"fork llama-quantize not built under {fork}/build")
+                            reason=f"fork llama-quantize not built under {fork}/build "
+                                   "(run setup_env.py for the target model — it "
+                                   "codegens bitnet-lut-kernels.h then builds)")
     out_gguf = Path(out_gguf)
     f32_gguf = out_gguf.with_suffix(".f32.gguf")
     rc, log = _run([python, conv, str(baked_dir), "--outfile", f32_gguf,

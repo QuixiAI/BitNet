@@ -1,8 +1,8 @@
 # Track A1 — Llama-3.2-1B pathfinder (train_plan §2.2). The profile is the ONLY
 # per-track truth: conversion, param groups, eval modes, export routes all read it.
 name: a1
-base_model: meta-llama/Llama-3.2-1B
-teacher: meta-llama/Llama-3.2-1B
+base_model: unsloth/Llama-3.2-1B
+teacher: unsloth/Llama-3.2-1B
 
 # Enumerate, don't assume: every nn.Linear must fullmatch exactly one list.
 target_linear_regexes:
@@ -17,5 +17,5 @@ quant: {granularity: tensor, group_k: 32}   # per-tensor absmean = §3.4 baselin
 export_route: [i2s_bitnet_cpp, tq2_upstream]
 eval_modes: [w_a8, w_only]        # §8.4 pairing: w_a8 <-> I2_S, w_only <-> TQ2_0
 data:
-  tokenizer: meta-llama/Llama-3.2-1B
+  tokenizer: unsloth/Llama-3.2-1B
   shard_set: llama3

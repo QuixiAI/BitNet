@@ -37,11 +37,13 @@ class RouterHooks:
                 self.pairs.append((block, router, mod))
         self._handles = []
         self.collect_aux = False
+        self.capture_routing = False                    # per-token top-k for §6.2 agreement
         self._aux_logits: list[torch.Tensor] = []
         self._routed: dict[int, set[int]] = {}          # id(experts_mod) -> expert ids
         self._load: dict[str, torch.Tensor] = {}        # layer -> expert token counts
         self._entropy: dict[str, list[float]] = {}
         self._tokens: dict[str, int] = {}
+        self._routing: dict[str, list] = {}             # block -> per-token top-k ids
 
     def attach(self):
         for block, router, experts in self.pairs:
@@ -62,6 +64,9 @@ class RouterHooks:
             if self.collect_aux:
                 self._aux_logits.append(logits)
             with torch.no_grad():
+                if self.capture_routing:
+                    self._routing.setdefault(block, []).append(
+                        idx.reshape(-1, idx.shape[-1]).cpu())
                 ids = idx.reshape(-1)
                 self._routed.setdefault(id(experts), set()).update(
                     ids.unique().tolist())
@@ -87,6 +92,30 @@ class RouterHooks:
 
     def clear_aux(self):
         self._aux_logits = []
+
+    # ---- per-layer top-8 teacher agreement (§6.2), after a capture pass ----
+    def routing_and_reset(self) -> dict[str, torch.Tensor]:
+        out = {b: torch.cat(v, 0) for b, v in self._routing.items() if v}
+        self._routing = {}
+        return out
+
+    def agreement_vs_teacher(self, teacher_routing: dict[str, torch.Tensor]) -> dict:
+        """Per-block top-k agreement of the just-captured student routing vs the
+        teacher fixture (same calibration windows, same order). Returns
+        {block: agreement} + a depth-ordered '_by_depth' list + '_mean'."""
+        student = self.routing_and_reset()
+        per, depth = {}, []
+        for block in sorted(student, key=lambda b: int(b.split(".layers.")[1].split(".")[0])
+                            if ".layers." in b else 0):
+            if block not in teacher_routing:
+                continue
+            n = min(student[block].shape[0], teacher_routing[block].shape[0])
+            a = top8_agreement(student[block][:n], teacher_routing[block][:n])
+            per[block] = a
+            depth.append(a)
+        per["_by_depth"] = depth
+        per["_mean"] = sum(depth) / len(depth) if depth else float("nan")
+        return per
 
     # ---- decay masker feed (per optimizer step) ----
     def routed_and_reset(self) -> dict[int, list[int]]:
@@ -145,8 +174,46 @@ class RouterHooks:
 
 
 def top8_agreement(student_idx: torch.Tensor, teacher_idx: torch.Tensor) -> float:
-    """Per-layer top-k agreement with the teacher's routing (moe §6.2 — the MoE
-    analogue of KL_tf; depth-aware interpretation is the caller's job)."""
+    """Per-token fraction of the student's selected experts that are also in the
+    teacher's selection (moe §6.2 — the MoE analogue of KL_tf). Depth-aware
+    interpretation is the caller's job: only layer 1 is exact at t=0; deeper
+    routers see inputs already carrying accumulated error, so expect a depth
+    gradient dipping then re-stabilizing."""
     k = student_idx.shape[-1]
-    s = student_idx.unsqueeze(-1) == teacher_idx.unsqueeze(-2)
-    return float(s.any(-1).float().mean() / 1.0) * 1.0 if k else float("nan")
+    if not k:
+        return float("nan")
+    hit = (student_idx.unsqueeze(-1) == teacher_idx.unsqueeze(-2)).any(-1)
+    return float(hit.float().mean())
+
+
+@torch.no_grad()
+def capture_teacher_routing(teacher, windows: torch.Tensor, device,
+                           top_k: int, batch_size: int = 1) -> dict[str, torch.Tensor]:
+    """Q-T0 §8.1 item 8: the teacher's per-layer routed top-k on the calibration
+    set, the fixture the §6.2 agreement metric compares against. Keyed by the
+    experts-block name (matching RouterHooks.pairs), value (n_tokens, top_k)."""
+    hooks = []
+    # the teacher is dense — hook every mlp.gate router (Qwen3MoeTopKRouter, whose
+    # forward returns (logits, scores, top_k_indices)); block key matches
+    # RouterHooks.pairs (name up to '.experts' / '.gate').
+    routers = [(name.rsplit(".gate", 1)[0], mod)
+               for name, mod in teacher.named_modules()
+               if name.endswith(".mlp.gate") and hasattr(mod, "weight")]
+
+    store: dict[str, list] = {b: [] for b, _ in routers}
+
+    def mk(block):
+        def hook(_m, _i, out):
+            idx = out[2] if isinstance(out, tuple) and len(out) >= 3 else None
+            if idx is not None:
+                store[block].append(idx.reshape(-1, idx.shape[-1]).cpu())
+        return hook
+
+    for block, r in routers:
+        hooks.append(r.register_forward_hook(mk(block)))
+    teacher.eval()
+    for i in range(0, windows.shape[0], batch_size):
+        teacher(windows[i:i + batch_size].to(device))
+    for h in hooks:
+        h.remove()
+    return {b: torch.cat(v, 0) for b, v in store.items() if v}

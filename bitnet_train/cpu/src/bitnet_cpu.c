@@ -252,6 +252,37 @@ void bn_expert_ffn_w2a8(const float *x, int64_t H, int64_t I,
     }
 }
 
+// ---------------------------------------------------------------------------
+// TL1-format expert FFN (the formats_bakeoff.md follow-up: gate/up/down on the
+// LUT-partial-sum format, projected ~2x the format-A decode). Same decode math
+// as bn_expert_ffn_w2a8, but the three matmuls run through bn_gemv_tl1. Weights
+// are pre-repacked via bn_pack_tl1 (I and H must be %16). The caller provides
+// float scratch g_scratch/u_scratch (I each) + h_scratch (max(I,H)) + the tl1
+// lut scratch (K/2*32 int8, sized for max(H,I)). The scalar/NEON split is inside
+// bn_gemv_tl1, diffed against the scalar oracle in CI — same discipline as A.
+// ---------------------------------------------------------------------------
+void bn_gemv_tl1(const uint8_t *wt, int64_t N, int64_t K, const int8_t *xq,
+                 float a_scale, int pt, float *out, int8_t *lut_scratch);   // fwd (defined below)
+
+void bn_expert_ffn_tl1(const float *x, int64_t H, int64_t I,
+                       const uint8_t *gate_wt, const uint8_t *up_wt,
+                       const uint8_t *down_wt, int pt, float w_r,
+                       int8_t *xq_scratch, int8_t *hq_scratch, float *g_scratch,
+                       float *u_scratch, float *h_scratch, int8_t *lut_scratch,
+                       float *out) {
+    const float as = bn_act_quant_int8(x, H, xq_scratch);
+    bn_gemv_tl1(gate_wt, I, H, xq_scratch, as, pt, g_scratch, lut_scratch);
+    bn_gemv_tl1(up_wt,   I, H, xq_scratch, as, pt, u_scratch, lut_scratch);
+    for (int64_t i = 0; i < I; i++) {
+        const float g = g_scratch[i];
+        h_scratch[i] = (g / (1.0f + expf(-g))) * u_scratch[i];   // silu(gate)*up
+    }
+    const float hs = bn_act_quant_int8(h_scratch, I, hq_scratch);
+    // bn_gemv_tl1 applies hs internally (as a_scale), so the epilogue only weights
+    bn_gemv_tl1(down_wt, H, I, hq_scratch, hs, pt, g_scratch, lut_scratch);  // reuse g_scratch
+    for (int64_t n = 0; n < H; n++) out[n] += w_r * g_scratch[n];
+}
+
 // MoE decode step over the selected experts (weights read in place; ids/weights from
 // the router). expert_stride_* are BYTE strides between consecutive experts' packs.
 void bn_moe_ffn_w2a8(const float *x, int64_t H, int64_t I, int64_t k,

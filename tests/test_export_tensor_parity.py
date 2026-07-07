@@ -75,6 +75,47 @@ def test_group_baking_breaks_tq2_parity():
     assert (ref_codes != codes.numpy()).mean() > 0.05
 
 
+def _pack_i2s(codes: np.ndarray, scale: float) -> np.ndarray:
+    """Inverse of decode_i2s, mirroring the fork's quantize_i2_s packing loop:
+    n/4 code bytes then a trailing f32 scale. code map {-1:0, 0:1, +1:2}."""
+    n = codes.size
+    q8 = np.where(codes == 0, 1, np.where(codes > 0, 2, 0)).astype(np.uint8).reshape(-1)
+    nblk = n // 128
+    bytes_out = np.zeros(nblk * 32, np.uint8)
+    for g in range(4):
+        seg = q8.reshape(nblk, 128)[:, g * 32:(g + 1) * 32]
+        bytes_out.reshape(nblk, 32)[:] |= (seg << (6 - 2 * g)).astype(np.uint8)
+    return np.concatenate([bytes_out, np.frombuffer(
+        np.float32(scale).tobytes(), np.uint8)])
+
+
+def test_i2s_pack_decode_roundtrip():
+    from bitnet_train.export.compare_gguf import decode_i2s
+    N, K = 8, 512                                       # n % 128 == 0
+    codes = rng.integers(-1, 2, (N, K)).astype(np.int8)
+    raw = _pack_i2s(codes, 0.037)
+    got, s = decode_i2s(raw, N, K)
+    np.testing.assert_array_equal(got, codes)
+    assert abs(s - np.float32(0.037)) < 1e-9
+
+
+def test_i2s_is_preserve_regime_for_baked():
+    """Baked {-s,0,+s} -> I2_S re-quantization recovers codes AND scale exactly:
+    the scale is the tensor absmax, which for baked ternary IS s (no F16 block
+    rounding — the scale is per-tensor f32)."""
+    from bitnet_train.export.compare_gguf import decode_i2s, encode_i2s_ref
+    w = torch.randn(4, 512) * 0.03
+    codes, scale = quant.ternary_codes(w, "tensor")
+    baked = quant.dequant_codes(codes, scale).numpy()
+    ref_codes, ref_s = encode_i2s_ref(baked)
+    np.testing.assert_array_equal(ref_codes, codes.numpy())
+    assert abs(ref_s - float(scale.to(torch.float16).float())) < 1e-6
+    # full circle: pack -> decode -> dequant == baked exactly
+    raw = _pack_i2s(ref_codes, ref_s)
+    got, s = decode_i2s(raw, 4, 512)
+    np.testing.assert_array_equal(got.astype(np.float32) * s, baked)
+
+
 def test_bake_checkpoint_tiny(tmp_path):
     transformers = pytest.importorskip("transformers")
     from transformers import LlamaConfig, LlamaForCausalLM

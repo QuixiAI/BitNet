@@ -90,12 +90,15 @@ def act_quant_int8(x: torch.Tensor) -> torch.Tensor:
 
 
 def bitlinear_reference(x: torch.Tensor, w: torch.Tensor, group_k: int = 32,
-                        granularity: str = "group", act_quant: bool = True) -> torch.Tensor:
+                        granularity: str = "group", act_quant: bool = True,
+                        lam: float = 1.0) -> torch.Tensor:
     """STE BitLinear forward, pure PyTorch (train_plan.md §4 with §2-of-new-kernels scales).
-    act_quant=False is the W-only forward (eval modes w_only/a0; A2w/Q-A1w training)."""
+    act_quant=False is the W-only forward (eval modes w_only/a0; A2w/Q-A1w training).
+    lam < 1 is the A3/Q-A3 stability ramp: w_eff = (1-lam)*w + lam*quant(w) — the
+    FIXED ramp stays outside the backward graph (STE blend on the detached delta)."""
     wq_f = weight_quant_pertensor(w) if granularity == "tensor" else weight_quant_pergroup(w, group_k)
     x_q = x + (act_quant_int8(x) - x).detach() if act_quant else x
-    w_q = w + (wq_f - w).detach()
+    w_q = w + lam * (wq_f - w).detach()
     return F.linear(x_q, w_q)
 
 
@@ -164,6 +167,7 @@ class BitLinear(nn.Module):
                                                device=device, dtype=dtype or torch.float32))
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
         self.act_quant = True                     # False = W-only forward (eval modes / A2w)
+        self.lam = 1.0                            # A3 ramp: <1 blends dense->ternary (STE-safe)
         self._packed = None                       # eval-time cached wq — see freeze()
         self._wcache = (-1, None, None)           # (weight._version, wq, w_deq): the weight
         # only changes at optimizer steps, so grad-accum micro-batches and gradient-checkpoint
@@ -193,10 +197,12 @@ class BitLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lead, K = x.shape[:-1], x.shape[-1]
         x2 = x.reshape(-1, K)
-        if self.backend == "reference":
+        if self.backend == "reference" or self.lam < 1.0:
+            # the ramp needs the dense latent in the blend anyway — pure torch is
+            # the honest route for lam < 1 on any backend
             y = bitlinear_reference(x2, self.weight.to(x2.dtype) if x2.dtype != self.weight.dtype
                                     else self.weight, self.group_k, self.granularity,
-                                    self.act_quant)
+                                    self.act_quant, self.lam)
         elif self._packed is not None and not self.training:
             y = _infer_w2a8(x2, self._packed, self.act_quant)
         else:

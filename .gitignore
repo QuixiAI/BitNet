@@ -60,3 +60,6 @@ train/checkpoints/
 train/_selftest_shards/
 runs/
 wandb/
+
+# perf harness raw output
+bitnet_train/perf/results/*/

@@ -76,10 +76,40 @@ def encode_tq2_0_ref(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return codes.reshape(N, K), d.astype(np.float16).astype(np.float32)
 
 
-def decode_i2s(raw: np.ndarray, N: int, K: int):
-    raise NotImplementedError(
-        "I2_S decoder: transcribe from the fork's ggml once the 3rdparty/llama.cpp "
-        "submodule is initialized (T0 recon item, train_plan §11.1)")
+_I2S_MAP = np.array([-1, 0, 1, 0], np.int8)   # ggml map2bit {0:-1,1:0,2:+1,3:0}
+
+
+def decode_i2s(raw: np.ndarray, N: int, K: int) -> tuple[np.ndarray, float]:
+    """Eddie-Wang fork I2_S -> (codes int8 (N,K) in {-1,0,+1}, per-TENSOR scale).
+    Transcribed from ggml-quants.c dequantize_row_i2_s / quantize_i2_s (fork
+    3rdparty/llama.cpp @ 1f86f05, read 2026-07-07):
+
+      layout: n/4 code bytes then a trailing f32 scale (i2_scale = ABSMAX of the
+      (baked) tensor). Flat element e = 128*i + 32*g + p lives in byte[32*i + p]
+      at bits (6 - 2*g); code in {0,1,2,3} -> {-1,0,+1,0}.
+
+    Because baked ternary is exactly {-s, 0, +s}, its absmax IS s — so I2_S is a
+    PRESERVE-regime route (codes AND scale reproduce from baked input), like
+    TQ2_0. i2_scale is per-tensor, not per-block, so there is no F16 block-scale
+    rounding on this route."""
+    n = N * K
+    code_bytes = np.frombuffer(raw.tobytes()[:n // 4], dtype=np.uint8)
+    scale = float(np.frombuffer(raw.tobytes()[n // 4:n // 4 + 4], dtype=np.float32)[0])
+    nblk = n // 128                                  # 128 elements / 32 bytes
+    b = code_bytes[:nblk * 32].reshape(nblk, 32)
+    codes = np.empty((nblk, 4, 32), np.int8)
+    for g in range(4):
+        codes[:, g, :] = _I2S_MAP[(b >> (6 - 2 * g)) & 3]
+    return codes.reshape(n)[:n].reshape(N, K), scale
+
+
+def encode_i2s_ref(x: np.ndarray) -> tuple[np.ndarray, float]:
+    """Reference re-quantization mirroring quantize_i2_s: per-TENSOR absmax scale,
+    code = sign (2 if >0, 0 if <0, 1 if ~0). For baked {-s,0,+s} input the sign is
+    exact and absmax == s."""
+    scale = float(np.abs(x).max())
+    codes = np.where(np.abs(x) < 1e-6, 0, np.where(x > 0, 1, -1)).astype(np.int8)
+    return codes, scale
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +232,19 @@ def tensor_parity(baked_dir: str | Path, gguf_path: str | Path,
                                   mean_abs_err=float(err.mean()),
                                   detail="stored dense (not ternary-packed)")
         elif ttype == "I2_S":
-            row = TensorParityRow(hf_name, gname, ttype, "skipped",
-                                  detail="I2_S decoder pending fork submodule init")
+            got_codes, got_s = decode_i2s(np.frombuffer(t.data.tobytes(),
+                                                        dtype=np.uint8), N, K)
+            ref_codes, ref_s = encode_i2s_ref(x)
+            mism = float((got_codes != ref_codes).mean())
+            deq = got_codes.astype(np.float32) * got_s
+            err = np.abs(deq - x)
+            row = TensorParityRow(
+                hf_name, gname, ttype,
+                "exact" if mism == 0 else "mismatch",
+                code_mismatch_rate=mism, max_abs_err=float(err.max()),
+                mean_abs_err=float(err.mean()),
+                within_f16_bound=True,   # per-tensor f32 scale, no block rounding
+                detail=f"per-tensor scale {got_s:.4g}")
         else:
             row = TensorParityRow(hf_name, gname, ttype, "skipped",
                                   detail=f"no decoder for {ttype}")

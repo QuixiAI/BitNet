@@ -1,0 +1,22 @@
+# Accelerate FSDP config for the Q-track (moe_train_plan §5.4: 4-way FSDP
+# planning floor, >=4x80GB). Launch:
+#   accelerate launch --config_file train/configs/accelerate/fsdp_q15b.yaml \
+#       train/train.py --config train/configs/q15b/t1.yaml
+#
+# find_unused_parameters is moot under FSDP (§5.6); the sharded optimizer state
+# is what makes the 15B trainable. bf16 latents + fp32 masters come from the
+# trainer's --latent-dtype bf16 / MasterAdamW path, NOT from mixed_precision
+# (which would also cast the fp32 masters).
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+use_cpu: false
+num_processes: 4
+fsdp_config:
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: Qwen3MoeDecoderLayer
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_offload_params: false
+  fsdp_use_orig_params: true          # required for per-parameter param groups + decay mask
