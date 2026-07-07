@@ -53,3 +53,10 @@ bitnet_train/metal/tk_torch/*.metallib
 bitnet_train/metal/tk_torch/build/
 *.metallib
 bitnet_train/cpu/*.dylib
+
+# training-run outputs
+train/data/
+train/checkpoints/
+train/_selftest_shards/
+runs/
+wandb/

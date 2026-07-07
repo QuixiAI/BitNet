@@ -82,3 +82,25 @@ device pitfalls were load-bearing and are documented in the kernel: fast-math
 division computes absmax/448 one ulp off (fixed with an fma Newton re-round), and
 fast-math tie rounding is not RNE (fixed with an exact fma halfway comparison).
 tk_e4m3_encode (round-half-away) was deliberately not used.
+
+## Addendum (2026-07-07): TQ2_0 as a first-class in-repo format
+
+llama.cpp's native ternary GGUF type, implemented in the VENDORED stack (no
+external runtime dependency): a `tq2_0` dequant struct in the mittens format
+framework (which lights up `qgemm`/`qgemm_frag`/`qgemv`/`qdequant` and both MoE
+grouped-GEMM `_q` kernels via one-line instantiations) plus an on-device
+`quantize_tq2_0` pack kernel. Numerics transcribed from ggml-quants.c
+(reference tree, read 2026-07-07): per-256 ABSMAX half scale stored LAST
+({qs[64]; half d}), element 128j+32n+m in qs[32j+m] bits 2n, lroundf codes.
+
+Byte-exactness vs the ggml reference required the two now-familiar fast-math
+fixes (see fake_quant_fp8): an fma-Newton re-round of 1/d, and hand-rolled
+round-half-away (fast round sends exact ±0.5 ties — which bf16-grid inputs
+hit — to zero). `tests/test_metal_tq2_0.py` asserts byte-exact packs vs the
+numpy oracle, the §8.2 baked-ternary preserve regime end-to-end in-repo, and
+qgemv/qgemm parity vs dense.
+
+Measured (M4 Max, 2048×2048): quantize 93 µs, qgemv 49 µs (vs 33 µs for the
+10B/32 bitnet format — TQ2_0's 66B/256 blocks dequant-scatter worse; fine for
+eval, not a training-path kernel), qgemm M=64 via the qdequant route 234 µs,
+full dequant 35 µs.

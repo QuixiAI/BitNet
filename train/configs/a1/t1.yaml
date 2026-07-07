@@ -1,0 +1,21 @@
+# A1 T1 starter config (train_plan §5.6 — "so the first run needs no design
+# meeting"). ~65k tokens/step; LR is the grid point — sweep 3e-5, 1e-4, 2e-4,
+# 4e-4 via --set lr=... (§5.3), decided by data + the code-flip readout.
+profile: train/profiles/a1.yaml
+data_dir: train/data/llama3
+run_name: a1-t1
+seq_len: 1024
+batch_size: 8
+grad_accum: 8
+warmup_steps: 200
+lr: 1.0e-4
+weight_decay: 0.1
+mixed_precision: bf16
+grad_checkpointing: true
+kd: dense
+kd_alpha: 1.0
+kd_tau: 2.0
+eval_every: 200
+calib_windows: 64
+save_every: 1000
+total_tokens: 1.0e+8

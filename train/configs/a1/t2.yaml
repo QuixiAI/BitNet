@@ -1,0 +1,21 @@
+# A1 T2 PoC heal (train_plan §11.4): the T1-chosen recipe, scaled toward
+# 0.25-0.5M tokens/step via accumulation — not design changes. Set lr from the
+# T1 grid winner before launching.
+profile: train/profiles/a1.yaml
+data_dir: train/data/llama3
+run_name: a1-t2
+seq_len: 2048
+batch_size: 8
+grad_accum: 16
+warmup_steps: 1000
+lr: 1.0e-4            # REPLACE with the T1 winner
+weight_decay: 0.1
+mixed_precision: bf16
+grad_checkpointing: true
+kd: dense
+kd_alpha: 1.0
+kd_tau: 2.0
+eval_every: 200
+calib_windows: 64
+save_every: 500
+total_tokens: 1.0e+9

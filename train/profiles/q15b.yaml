@@ -1,0 +1,44 @@
+# Track Q — Qwen3-15B-A2B experts-only heal (moe_train_plan). Training SPEND is
+# gated on Q-T0/Q-K0; this profile encodes the §1.2 conversion contract.
+#
+# Q-T0 recon fact (2026-07-06, transformers 5.13): the v5 qwen3_moe layout fuses
+# all experts into 3-D parameters (mlp.experts.gate_up_proj (E,2I,H), .down_proj
+# (E,H,I)) and the router is Qwen3MoeTopKRouter — NOT nn.Linear. So experts are
+# converted by MODULE swap (expert_stack_regexes -> BitExperts) and the
+# gate/gate_proj regex trap is structurally defanged: there is no router Linear
+# to mis-match. The conversion test still asserts the router survives untouched.
+name: q15b
+base_model: Qwen/Qwen3-15B-A2B     # provenance/license PINNED at Q-T0 (§1.1) before any run
+teacher: Qwen/Qwen3-15B-A2B
+
+target_linear_regexes: []          # v5: no per-expert Linears (see recon note above)
+expert_stack_regexes:
+  - model\.layers\.\d+\.mlp\.experts
+keep_fp_regexes:                   # every remaining nn.Linear, enumerated
+  - model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj
+  - lm_head
+
+freeze_fp_params: false            # freezing is done via param_groups below (finer control)
+quant: {granularity: tensor, group_k: 32}   # per-tensor per logical expert matrix (§3.7)
+export_route: [tq2_upstream]
+eval_modes: [a0, a1, b]            # §7.5 parity matrix
+aux_loss: true                     # the model's own router_aux_loss_coef, never invented (§5.1)
+decay_masking: true                # cold-expert decay mask MANDATORY (§4.3); the trainer
+                                   # forces expert wd=0 until test_decay_mask is green (§5.2)
+fp8_exclude_regexes:
+  - model\.layers\.\d+\.mlp\.gate  # router: BF16 forever (§3.2), even in mode b
+
+# moe_train_plan §5.2 — ordered, first-fullmatch-wins over PARAMETER names.
+param_groups:
+  - {name: experts, match: 'model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)',
+     lr_scale: 1.0, weight_decay: 0.1, decay_masked: true}
+  - {name: router, match: 'model\.layers\.\d+\.mlp\.gate\.weight',
+     lr_scale: 0.1, weight_decay: 0.0}
+  - {name: norms, match: '.*norm\.weight', lr_scale: 0.1, weight_decay: 0.0}
+  - {name: attention, match: 'model\.layers\.\d+\.self_attn\..*', frozen: true}
+  - {name: embeddings, match: '(model\.embed_tokens|lm_head)\.weight', frozen: true}
+  - {name: rest, match: '.*', lr_scale: 1.0, weight_decay: 0.0}
+
+data:
+  tokenizer: Qwen/Qwen3-15B-A2B
+  shard_set: qwen3

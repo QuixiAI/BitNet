@@ -1,0 +1,26 @@
+# CI micro-loop config (train_plan §7.3): tiny random Llama, CPU, reference
+# backend, chunked losses, minutes not hours. Driven by tests/test_ci_microloop.py
+# (which supplies --init/--data-dir from fixtures).
+profile: train/profiles/ci_tiny.yaml
+run_name: ci-tiny
+backend: reference
+seq_len: 32
+batch_size: 2
+grad_accum: 2
+warmup_steps: 2
+lr: 1.0e-3
+weight_decay: 0.1
+mixed_precision: "no"
+grad_checkpointing: false
+kd: dense
+teacher: __self__
+vchunk: 128
+tchunk: 16
+no_fused_losses: true
+eval_every: 5
+calib_windows: 2
+save_every: 5
+log_every: 5
+no_tqdm: true
+wandb: false
+empty_cache_every: 0

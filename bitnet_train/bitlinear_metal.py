@@ -38,14 +38,19 @@ _TK = None
 
 
 def _tk():
-    """Lazy tk_torch import so the reference backend works without the Metal toolchain."""
+    """Lazy tk_torch import so the reference backend works without the Metal toolchain.
+    The VENDORED copy (bitnet_train/metal) is pinned ahead of any installed tk_torch
+    (e.g. an editable QuixiCore checkout) — the BitNet training kernels and their
+    numerics live in the snapshot, not upstream."""
     global _TK
     if _TK is None:
-        try:
-            import tk_torch as m
-        except ImportError:
-            sys.path.insert(0, str(Path(__file__).resolve().parent / "metal"))
-            import tk_torch as m
+        vendored = str(Path(__file__).resolve().parent / "metal")
+        if vendored not in sys.path:
+            sys.path.insert(0, vendored)
+        import tk_torch as m
+        assert hasattr(m, "weight_quant_ternary"), (
+            f"tk_torch resolved to {m.__file__} without the BitNet kernels; "
+            "expected the vendored bitnet_train/metal copy")
         _TK = m
     return _TK
 
@@ -85,10 +90,11 @@ def act_quant_int8(x: torch.Tensor) -> torch.Tensor:
 
 
 def bitlinear_reference(x: torch.Tensor, w: torch.Tensor, group_k: int = 32,
-                        granularity: str = "group") -> torch.Tensor:
-    """STE BitLinear forward, pure PyTorch (train_plan.md §4 with §2-of-new-kernels scales)."""
+                        granularity: str = "group", act_quant: bool = True) -> torch.Tensor:
+    """STE BitLinear forward, pure PyTorch (train_plan.md §4 with §2-of-new-kernels scales).
+    act_quant=False is the W-only forward (eval modes w_only/a0; A2w/Q-A1w training)."""
     wq_f = weight_quant_pertensor(w) if granularity == "tensor" else weight_quant_pergroup(w, group_k)
-    x_q = x + (act_quant_int8(x) - x).detach()
+    x_q = x + (act_quant_int8(x) - x).detach() if act_quant else x
     w_q = w + (wq_f - w).detach()
     return F.linear(x_q, w_q)
 
@@ -111,11 +117,14 @@ class BitLinearSTE(torch.autograd.Function):
     equal-or-better than matmul_custom on the backward shapes, without the transpose copy."""
 
     @staticmethod
-    def forward(ctx, x, W, group_k, w_deq=None):
+    def forward(ctx, x, W, group_k, w_deq=None, act_quant=True):
         tk = _tk()
         if w_deq is None:                                        # uncached path
             _, w_deq = tk.weight_quant_ternary(W, group_k)       # K1 (packed wq unused in training)
-        x_q, _, _ = tk.fake_quant_int8(x.contiguous())           # K4: one pass -> bf16 grid
+        if act_quant:
+            x_q, _, _ = tk.fake_quant_int8(x.contiguous())       # K4: one pass -> bf16 grid
+        else:
+            x_q = x.to(torch.bfloat16)                           # W-only forward (A2w/Q-A1w, eval)
         y = F.linear(x_q, w_deq)                                 # (M, N) bf16 MPS GEMM
         ctx.save_for_backward(w_deq, x_q)
         ctx.dtypes = (x.dtype, W.dtype)
@@ -128,7 +137,7 @@ class BitLinearSTE(torch.autograd.Function):
         g = grad_y.to(torch.bfloat16)
         grad_x = torch.matmul(g, w_deq)                          # (M,N)@(N,K) -> (M,K)
         grad_W = torch.matmul(g.t(), x_q)                        # (N,M)@(M,K) -> (N,K)
-        return grad_x.to(x_dtype), grad_W.to(w_dtype), None, None
+        return grad_x.to(x_dtype), grad_W.to(w_dtype), None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +163,7 @@ class BitLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(out_features, in_features,
                                                device=device, dtype=dtype or torch.float32))
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        self.act_quant = True                     # False = W-only forward (eval modes / A2w)
         self._packed = None                       # eval-time cached wq — see freeze()
         self._wcache = (-1, None, None)           # (weight._version, wq, w_deq): the weight
         # only changes at optimizer steps, so grad-accum micro-batches and gradient-checkpoint
@@ -185,12 +195,13 @@ class BitLinear(nn.Module):
         x2 = x.reshape(-1, K)
         if self.backend == "reference":
             y = bitlinear_reference(x2, self.weight.to(x2.dtype) if x2.dtype != self.weight.dtype
-                                    else self.weight, self.group_k, self.granularity)
+                                    else self.weight, self.group_k, self.granularity,
+                                    self.act_quant)
         elif self._packed is not None and not self.training:
-            y = _infer_w2a8(x2, self._packed)
+            y = _infer_w2a8(x2, self._packed, self.act_quant)
         else:
             _, w_deq = self._quant_weight()
-            y = BitLinearSTE.apply(x2, self.weight, self.group_k, w_deq)
+            y = BitLinearSTE.apply(x2, self.weight, self.group_k, w_deq, self.act_quant)
         return y.reshape(*lead, self.out_features)
 
     def extra_repr(self):
@@ -199,12 +210,19 @@ class BitLinear(nn.Module):
                 f"granularity={self.granularity}")
 
 
-def _infer_w2a8(x2: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
+def _infer_w2a8(x2: torch.Tensor, wq: torch.Tensor, act_quant: bool = True) -> torch.Tensor:
     """W2A8 inference forward from pre-packed blocks (no dense weight materialized):
     integer GEMV at batch 1 (measured ~2x the dense matmul), dequant-to-half MMA
-    `qgemm(...,'bitnet')` on fake-quant activations otherwise."""
+    `qgemm(...,'bitnet')` on fake-quant activations otherwise. act_quant=False is
+    the W-only route (eval mode w_only/a0): half activations straight into the MMA."""
     tk = _tk()
     M = x2.shape[0]
+    if not act_quant:
+        xt = x2.to(torch.float16).t()                            # (K, M) half, no act quant
+        Mp = (M + 31) & ~31
+        if Mp != M:
+            xt = F.pad(xt, (0, Mp - M))
+        return tk.qgemm(wq, xt.contiguous(), "bitnet")[:, :M].t().to(x2.dtype)
     xq, a_scale = tk.quantize_per_token_int8(x2.contiguous())
     a_half = a_scale.to(torch.float16)
     if M == 1:

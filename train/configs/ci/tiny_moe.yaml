@@ -1,0 +1,27 @@
+# CI micro-loop, MoE twin (moe_train_plan §5.6): tiny random Qwen3-MoE
+# (2 layers, 8 experts, top-2), aux loss on, decay mask wired (expert wd stays 0
+# until tests/test_decay_mask.py is green — §5.2 fallback ordering).
+profile: train/profiles/ci_tiny_moe.yaml
+run_name: ci-tiny-moe
+backend: reference
+seq_len: 32
+batch_size: 2
+grad_accum: 2
+warmup_steps: 2
+lr: 1.0e-3
+weight_decay: 0.1
+expert_weight_decay: 0.0
+mixed_precision: "no"
+grad_checkpointing: false
+kd: dense
+teacher: __self__
+vchunk: 128
+tchunk: 16
+no_fused_losses: true
+eval_every: 5
+calib_windows: 2
+save_every: 5
+log_every: 5
+no_tqdm: true
+wandb: false
+empty_cache_every: 0

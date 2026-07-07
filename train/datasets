@@ -1,0 +1,5 @@
+# One HF dataset per line: org/repo or org/repo:config (#-comments ok).
+# Heal, do not domain-shift (train_plan §5.5): general/educational web, wiki, code.
+HuggingFaceFW/fineweb-edu:sample-10BT
+wikimedia/wikipedia:20231101.en
+bigcode/the-stack-smol

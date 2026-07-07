@@ -1247,6 +1247,19 @@ void launch_moe_gather_bwd(E& e, typename E::in_t dA, typename E::in_t inv_idx,
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
+// ----- quantize_tq2_0 (llama.cpp-native ternary export blocks): W@0(E,N,K) ->
+//        wq@1(u8 (E,N,K/256,66) ggml block_tq2_0) w_deq@2(bf16) ; K@3 N@4 ;
+//        grid (N, E, 1), 32 thr. Per-256 absmax scale, ggml bit order. -----
+template <class E>
+void launch_quantize_tq2_0(E& e, typename E::in_t w, typename E::out_t wq,
+                           typename E::out_t w_deq, int NE, int N, int K,
+                           const std::string& type_name) {
+  e.pipeline("quantize_tq2_0_" + type_name);
+  e.in(w, 0); e.out(wq, 1); e.out(w_deq, 2);
+  e.bytes(K, 3); e.bytes(N, 4);
+  e.dispatch(N, NE, 1, 32, 1, 1);
+}
+
 // ----- fp8 norm epilogues: codes=e4m3(norm(x+residual)*w[+b]/scale). res_out=x+residual (bf16).
 //        static: inv_scale param; dyn: per-row absmax/448 -> scale output. grid (M,1,1). -----
 template <class E>

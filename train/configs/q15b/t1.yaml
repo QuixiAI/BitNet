@@ -1,0 +1,25 @@
+# Q-T1 tiny heal + stack shakedown (moe_train_plan §8.3). GATED: do not launch
+# before Q-T0 and Q-K0 pass (§0.4). Expert LR grid 1e-4, 2e-4, 4e-4, 8e-4 via
+# --set lr=... (§5.3; shifted high — narrow experts + sparse routing). Expert
+# weight decay stays 0 until tests/test_decay_mask.py is green under the REAL
+# optimizer wrapping (§5.2); then set expert_weight_decay: 0.1.
+profile: train/profiles/q15b.yaml
+data_dir: train/data/qwen3
+run_name: q15b-t1
+seq_len: 1024
+batch_size: 4
+grad_accum: 16
+warmup_steps: 200
+lr: 2.0e-4
+weight_decay: 0.1
+expert_weight_decay: 0.0
+mixed_precision: bf16
+grad_checkpointing: true
+kd: topk              # the recommended default for the big-teacher tracks (§5.1)
+kd_alpha: 1.0
+kd_tau: 2.0
+kd_tail_mode: 0       # renorm; the config-recorded choice that changes gradients
+eval_every: 200
+calib_windows: 32
+save_every: 500
+total_tokens: 1.5e+8

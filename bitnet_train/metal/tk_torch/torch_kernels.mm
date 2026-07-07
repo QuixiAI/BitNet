@@ -3278,6 +3278,45 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> silu_mul_fake_quant_int8_m
   return {x_q, codes, scale};
 }
 
+// llama.cpp-native TQ2_0 pack: W (N,K)|(E,N,K) -> (wq uint8 ggml block_tq2_0
+// (..., K/256, 66), w_deq bf16). Per-256 absmax scale, ggml bit order — the
+// upstream export route's exact format, packed on-device.
+static std::tuple<at::Tensor, at::Tensor> quantize_tq2_0_mps(const at::Tensor& w_in) {
+  TORCH_CHECK(w_in.device().is_mps() && tk_is_float_dtype(w_in),
+              "quantize_tq2_0: W must be float MPS");
+  TORCH_CHECK(w_in.dim() == 2 || w_in.dim() == 3, "quantize_tq2_0: W (N,K) or (E,N,K)");
+  auto w = w_in.contiguous();
+  const int E = w.dim() == 3 ? w.size(0) : 1;
+  const int N = w.size(-2), K = w.size(-1);
+  TORCH_CHECK(K % 256 == 0, "quantize_tq2_0: K must be a multiple of 256");
+  std::vector<int64_t> qshape(w.sizes().begin(), w.sizes().end() - 1);
+  qshape.push_back(K / 256);
+  qshape.push_back(66);
+  auto wq = at::empty(qshape, w.options().dtype(at::kByte));
+  auto w_deq = at::empty(w.sizes(), w.options().dtype(at::kBFloat16));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantize_tq2_0(e, w, wq, w_deq, E, N, K, tk_type_name(w));
+  });
+  return {wq, w_deq};
+}
+
+// Standalone packed -> fp16 dense dequant for any qdequant-instantiated format
+// (parity tooling: decode llama-quantize output on MPS).
+static at::Tensor qdequant_mps(const at::Tensor& wq_in, const std::string& format) {
+  TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kByte,
+              "qdequant: wq must be uint8 MPS");
+  TORCH_CHECK(wq_in.dim() == 3, "qdequant: wq (N, K/block_k, block_bytes)");
+  auto wq = wq_in.contiguous();
+  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K" || format == "tq2_0") ? 256
+                    : (format == "kU4B8" || format == "kU4" || format == "fp8_block") ? 128
+                    : (format == "hqq") ? 64
+                    : (format == "nvfp4") ? 16 : 32;
+  const int N = wq.size(0), K = (int)wq.size(1) * block_k;
+  auto w = at::empty({N, K}, wq.options().dtype(at::kHalf));
+  tk_encode([&](TorchEncoder& e) { tk::launch_qdequant_fp16(e, w, wq, N, K, format); });
+  return w;
+}
+
 // Ternary-health monitors over packed wq (rows, nblocks, 10). counts int32 (rows, 3).
 static at::Tensor ternary_stats_mps(const at::Tensor& wq_in) {
   TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kByte,
@@ -4190,7 +4229,7 @@ static at::Tensor qgemm_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemm: x must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2, "qgemm: wq (N,K/bk,bytes), x (K,M)");
-  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K") ? 256
+  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K" || format == "tq2_0") ? 256
                     : (format == "kU4B8" || format == "kU4" || format == "fp8_block") ? 128
                     : (format == "hqq") ? 64
                     : (format == "nvfp4") ? 16 : 32;
@@ -4256,7 +4295,7 @@ static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemv: x must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && x.size(1) == 1, "qgemv: wq (N,K/bk,bytes), x (K,1)");
-  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K") ? 256
+  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K" || format == "tq2_0") ? 256
                     : (format == "kU4B8" || format == "kU4" || format == "fp8_block") ? 128
                     : (format == "hqq") ? 64
                     : (format == "nvfp4") ? 16 : 32;
@@ -4275,7 +4314,7 @@ static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in
               "qflux_gelu: x and bias must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous(), bias = bias_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && bias.dim() == 1, "qflux_gelu: wq (N,K/bk,bytes), x (K,M), bias (M)");
-  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K") ? 256
+  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K" || format == "tq2_0") ? 256
                     : (format == "kU4B8" || format == "kU4" || format == "fp8_block") ? 128
                     : (format == "hqq") ? 64
                     : (format == "nvfp4") ? 16 : 32;
@@ -4625,6 +4664,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("weight_quant_ternary_pt", &weight_quant_ternary_pt_mps,
         "BitNet K1-pt/K5: latent weight (N,K)|(E,N,K) -> (packed, dequant), per-TENSOR absmean per slice (MPS)",
         pybind11::arg("w"));
+  m.def("quantize_tq2_0", &quantize_tq2_0_mps,
+        "llama.cpp-native TQ2_0 pack: W -> (ggml block_tq2_0 bytes, w_deq bf16) (MPS)");
+  m.def("qdequant", &qdequant_mps,
+        "Packed quant blocks -> fp16 dense, any qdequant-instantiated format (MPS)");
   m.def("ternary_stats", &ternary_stats_mps,
         "Ternary health: packed wq -> per-row {-1,0,+1} code counts int32 (rows,3) (MPS)");
   m.def("code_flip_count", &code_flip_count_mps,

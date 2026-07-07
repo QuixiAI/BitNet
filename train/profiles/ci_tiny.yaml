@@ -1,0 +1,15 @@
+# CI micro-loop profile (train_plan §7.3): random 2-layer Llama-shape, CPU,
+# reference backend. Shapes respect BitLinear's in_features % 32 == 0.
+name: ci_tiny
+base_model: __random_tiny_llama__   # built by tests/train drivers, never downloaded
+teacher: __self__                   # dense twin of the same random weights
+target_linear_regexes:
+  - model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj
+  - model\.layers\.\d+\.mlp\.(gate|up|down)_proj
+keep_fp_regexes:
+  - lm_head
+freeze_fp_params: false
+quant: {granularity: tensor, group_k: 32}
+export_route: [i2s_bitnet_cpp, tq2_upstream]
+eval_modes: [w_a8, w_only]
+data: {tokenizer: __tiny__, shard_set: ci}

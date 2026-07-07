@@ -1,0 +1,29 @@
+# CI micro-loop, MoE twin (moe_train_plan §5.6): random tiny Qwen3-MoE
+# (2 layers, 8 experts, top-2), CPU, reference backend.
+name: ci_tiny_moe
+base_model: __random_tiny_qwen3moe__
+teacher: __self__
+target_linear_regexes: []
+expert_stack_regexes:
+  - model\.layers\.\d+\.mlp\.experts
+keep_fp_regexes:
+  - model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj
+  - lm_head
+freeze_fp_params: false
+quant: {granularity: tensor, group_k: 32}
+export_route: [tq2_upstream]
+eval_modes: [a0, a1, b]
+aux_loss: true
+decay_masking: true
+fp8_exclude_regexes:
+  - model\.layers\.\d+\.mlp\.gate
+param_groups:
+  - {name: experts, match: 'model\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)',
+     lr_scale: 1.0, weight_decay: 0.1, decay_masked: true}
+  - {name: router, match: 'model\.layers\.\d+\.mlp\.gate\.weight',
+     lr_scale: 0.1, weight_decay: 0.0}
+  - {name: norms, match: '.*norm\.weight', lr_scale: 0.1, weight_decay: 0.0}
+  - {name: attention, match: 'model\.layers\.\d+\.self_attn\..*', frozen: true}
+  - {name: embeddings, match: '(model\.embed_tokens|lm_head)\.weight', frozen: true}
+  - {name: rest, match: '.*', lr_scale: 1.0, weight_decay: 0.0}
+data: {tokenizer: __tiny__, shard_set: ci}

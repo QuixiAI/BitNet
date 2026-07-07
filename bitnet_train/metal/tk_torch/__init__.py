@@ -296,6 +296,21 @@ def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "bitnet"):
     return _ext.qgemv(wq, x, format)
 
 
+def quantize_tq2_0(W: torch.Tensor):
+    """Pack a latent/baked weight (N,K) or expert stack (E,N,K) into llama.cpp's
+    native TQ2_0 GGUF blocks: (wq uint8 (..., K/256, 66) {qs[64]; half d}, w_deq
+    bf16). ggml semantics exactly (per-256 ABSMAX scale, lround codes, ggml bit
+    order) — on per-tensor-baked {-s,0,+s} input this reproduces llama-quantize's
+    bytes bit-for-bit (the §8.2 preserve regime). K % 256 == 0. MPS."""
+    return tuple(_ext.quantize_tq2_0(W))
+
+
+def dequantize_tq2_0(wq: torch.Tensor):
+    """TQ2_0 packed blocks (N, K/256, 66) -> fp16 dense (N, K) — decode
+    llama-quantize output (or quantize_tq2_0's) on MPS for parity/eval."""
+    return _ext.qdequant(wq, "tq2_0")
+
+
 def qgemm_w2a8_fused(wq, x):
     """K2: fused per-token int8 act-quant + W2A8 GEMM (no int8 round-trip through
     device memory). x (M, K) float; wq packed (N, K/32, 10). -> (M, N) half, same
