@@ -41,3 +41,49 @@ def test_grad_flows_to_latent_not_ternary():
     lin(torch.randn(4, 32)).sum().backward()
     opt.step()
     assert not torch.equal(lin.weight.detach(), w0)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_act_quant_sibling_sharing_metal():
+    """q/k/v-style siblings fed the SAME input tensor run K4 once (routing
+    optimization 2026-07-07) and produce outputs/grads identical to distinct
+    per-module quantization; a mutated input misses the cache (_version guard)."""
+    from bitnet_train import bitlinear_metal as bm
+
+    dev = "mps"
+    sibs = [BitLinear(96, 64, backend="metal", granularity="tensor",
+                      device=dev) for _ in range(3)]
+    x_shared = torch.randn(4, 8, 96, device=dev, requires_grad=True)
+
+    calls = {"n": 0}
+    real_tk = bm._tk()
+    real_fq = real_tk.fake_quant_int8
+
+    def counting_fq(t):
+        calls["n"] += 1
+        return real_fq(t)
+
+    real_tk.fake_quant_int8 = counting_fq
+    try:
+        ys = [m(x_shared) for m in sibs]                 # same object -> 1 quant
+        assert calls["n"] == 1
+        sum(y.sum() for y in ys).backward()
+        gx_shared = x_shared.grad.clone()
+
+        calls["n"] = 0
+        x2 = x_shared.detach().clone().requires_grad_(True)
+        ys2 = [m(x2.clone()) for m in sibs]              # distinct objects -> 3 quants
+        assert calls["n"] == 3
+        sum(y.sum() for y in ys2).backward()
+        for a, b in zip(ys, ys2):
+            torch.testing.assert_close(a, b)
+        torch.testing.assert_close(gx_shared, x2.grad)
+
+        calls["n"] = 0
+        x3 = torch.randn(4, 8, 96, device=dev)
+        sibs[0](x3)
+        x3.mul_(2.0)                                     # bump _version
+        sibs[1](x3)
+        assert calls["n"] == 2                           # mutation defeats the cache
+    finally:
+        real_tk.fake_quant_int8 = real_fq

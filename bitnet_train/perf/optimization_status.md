@@ -84,6 +84,23 @@ quant cache in `bitlinear_metal.py` removes the recompute across grad-accum.
 A1 shapes (2026-07-07): 8192×2048 0.22 ms (310 GB/s), 2048×8192 0.25 ms
 (267 GB/s) — small shapes launch-bound but cost ≤ 40 µs. No dig outstanding.
 
+**2026-07-07 third pass — sibling act-quant sharing (routing): KEPT, for
+MEMORY not speed.** q/k/v receive the same layernorm output and gate/up the
+same block input, so per Llama layer 7 K4 quants covered only 4 distinct
+inputs. A `WeakTensorKeyDictionary` memo keyed on the module-input tensor
+(guarded by `_version`; weak keys die with the activations) now runs K4 once
+per distinct input and shares one x_q across siblings' saved-for-backward.
+
+Measured (2-layer real-shape converted slice, micro-batch 8×1024, fwd+bwd):
+- Throughput: **no measurable win** — 676.8 vs 677.1 ms/micro-step, inside
+  the 3 ms run-to-run drift. The ~0.65 ms/layer of eliminated kernel time is
+  invisible in a GEMM-dominated step. Do NOT cite this as a speedup.
+- Memory: **302 MB less fwd-graph allocation on 2 layers** (7259 vs 7561 MB,
+  stable across reruns) ≈ **2.4 GB across 16 layers** per micro-batch graph
+  — real headroom for micro-batch size / avoiding gradient checkpointing.
+- Semantics identical by construction (same tensor → same quant); suite
+  covers shared-vs-distinct outputs+grads and the mutation guard (176 green).
+
 ### ternary_stats / code_flip_count — §10.2 monitors
 
 134–259× vs PyTorch unpack (`gap_kernels_2026-07-06.md`); harness (smoke): 0.012

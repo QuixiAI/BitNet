@@ -106,6 +106,26 @@ def bitlinear_reference(x: torch.Tensor, w: torch.Tensor, group_k: int = 32,
 # Phase 1 — the Metal composition (K1 + reused kernels), STE backward
 # ---------------------------------------------------------------------------
 
+from torch.utils.weak import WeakTensorKeyDictionary
+
+# K4 act-quant memo keyed on the MODULE INPUT tensor object: q/k/v receive the
+# same layernorm output and gate/up the same block input, so one quant serves
+# all siblings (7 -> 4 quants per Llama layer; values identical by construction).
+# Weak keys die with the activations — no manual invalidation; _version guards
+# against in-place mutation between sibling calls. Shared x_q is also saved for
+# backward ONCE instead of per-sibling.
+_ACT_QUANT_CACHE = WeakTensorKeyDictionary()
+
+
+def _act_quant_shared(x: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+    hit = _ACT_QUANT_CACHE.get(x)
+    if hit is not None and hit[0] == x._version:
+        return hit[1]
+    x_q, _, _ = _tk().fake_quant_int8(x2.contiguous())
+    _ACT_QUANT_CACHE[x] = (x._version, x_q)
+    return x_q
+
+
 class BitLinearSTE(torch.autograd.Function):
     """forward:  quantize with the Metal kernels (K1 weights, per-token int8 acts), then a
     dense bf16 GEMM on the fake-quant operands; backward: grad_x = grad_y @ w_deq,
@@ -120,12 +140,13 @@ class BitLinearSTE(torch.autograd.Function):
     equal-or-better than matmul_custom on the backward shapes, without the transpose copy."""
 
     @staticmethod
-    def forward(ctx, x, W, group_k, w_deq=None, act_quant=True):
+    def forward(ctx, x, W, group_k, w_deq=None, act_quant=True, x_q=None):
         tk = _tk()
         if w_deq is None:                                        # uncached path
             _, w_deq = tk.weight_quant_ternary(W, group_k)       # K1 (packed wq unused in training)
         if act_quant:
-            x_q, _, _ = tk.fake_quant_int8(x.contiguous())       # K4: one pass -> bf16 grid
+            if x_q is None:                                      # no sibling-shared quant
+                x_q, _, _ = tk.fake_quant_int8(x.contiguous())   # K4: one pass -> bf16 grid
         else:
             x_q = x.to(torch.bfloat16)                           # W-only forward (A2w/Q-A1w, eval)
         y = F.linear(x_q, w_deq)                                 # (M, N) bf16 MPS GEMM
@@ -140,7 +161,7 @@ class BitLinearSTE(torch.autograd.Function):
         g = grad_y.to(torch.bfloat16)
         grad_x = torch.matmul(g, w_deq)                          # (M,N)@(N,K) -> (M,K)
         grad_W = torch.matmul(g.t(), x_q)                        # (N,M)@(M,K) -> (N,K)
-        return grad_x.to(x_dtype), grad_W.to(w_dtype), None, None, None
+        return grad_x.to(x_dtype), grad_W.to(w_dtype), None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +228,9 @@ class BitLinear(nn.Module):
             y = _infer_w2a8(x2, self._packed, self.act_quant)
         else:
             _, w_deq = self._quant_weight()
-            y = BitLinearSTE.apply(x2, self.weight, self.group_k, w_deq, self.act_quant)
+            x_qs = _act_quant_shared(x, x2) if self.act_quant else None
+            y = BitLinearSTE.apply(x2, self.weight, self.group_k, w_deq, self.act_quant,
+                                   x_qs)
         return y.reshape(*lead, self.out_features)
 
     def extra_repr(self):
