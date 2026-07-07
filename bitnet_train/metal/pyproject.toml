@@ -1,0 +1,35 @@
+# Standalone packaging for the PyTorch (Apple MPS) backend of the BitNet-training Metal
+# kernels, vendored from QuixiCore-Metal. A PyTorch user needs neither MLX nor the
+# Xcode/CMake build — only PyTorch and Xcode's Metal toolchain.
+#
+# torch is a RUNTIME dependency only: the ObjC++ extension JIT-compiles at import via
+# torch.utils.cpp_extension.load, and the metallib is built at import via `xcrun metal`.
+#
+# You do NOT have to install this to use it — `sys.path.insert(0, "bitnet_train/metal")`
+# then `import tk_torch` works in-tree. Editable install (`pip install -e bitnet_train/metal`)
+# is a convenience.
+#
+# NOT expressible here, but required: the Xcode Metal toolchain
+# (`xcodebuild -downloadComponent MetalToolchain`).
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitnet-metal"
+version = "0.0.0"
+description = "BitNet-training Metal kernels for PyTorch (Apple Metal / MPS backend), vendored from QuixiCore-Metal"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["tk_torch"]
+package-dir = { "tk_torch" = "tk_torch" }
+include-package-data = true
+
+[tool.setuptools.package-data]
+tk_torch = ["torch_kernels.mm"]

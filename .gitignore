@@ -1,5 +1,7 @@
 # Extensions
 
+.reference/
+
 *.a
 *.bat
 *.bin
@@ -45,3 +47,9 @@ poetry.toml
 
 build/
 logs/
+
+# BitNet training: vendored Metal kernel build artifacts (regenerated on import)
+bitnet_train/metal/tk_torch/*.metallib
+bitnet_train/metal/tk_torch/build/
+*.metallib
+bitnet_train/cpu/*.dylib
