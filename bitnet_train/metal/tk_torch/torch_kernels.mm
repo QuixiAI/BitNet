@@ -3399,6 +3399,48 @@ static at::Tensor kd_kl_dense_bwd_mps(const at::Tensor& t_in, const at::Tensor& 
   return grad;
 }
 
+// Fused CE + dense-KD (the heal loss). fwd -> (ce, kd, lse_sr, lse_st, lse_t);
+// bwd -> combined grad_s in ONE pass (replaces CE bwd + KD bwd + autograd grad-add).
+static std::vector<at::Tensor> kd_ce_fused_fwd_mps(
+    const at::Tensor& t_in, const at::Tensor& s_in, const at::Tensor& targets_in,
+    double invtemp) {
+  TORCH_CHECK(t_in.device().is_mps() && tk_is_float_dtype(t_in),
+              "kd_ce_fused_fwd: logits must be float MPS");
+  TORCH_CHECK(t_in.sizes() == s_in.sizes() && t_in.scalar_type() == s_in.scalar_type()
+              && t_in.dim() == 2, "kd_ce_fused_fwd: teacher/student (Tn, V) must match");
+  TORCH_CHECK(targets_in.scalar_type() == at::kInt && targets_in.numel() == t_in.size(0),
+              "kd_ce_fused_fwd: targets must be int32 (Tn,)");
+  auto t = t_in.contiguous(), s = s_in.contiguous(), tg = targets_in.contiguous();
+  const int rows = t.size(0), V = t.size(1);
+  auto opts = t.options().dtype(at::kFloat);
+  auto ce = at::empty({rows}, opts), kd = at::empty({rows}, opts);
+  auto lse_sr = at::empty({rows}, opts), lse_st = at::empty({rows}, opts);
+  auto lse_t = at::empty({rows}, opts);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kd_ce_fused_fwd(e, t, s, tg, ce, kd, lse_sr, lse_st, lse_t, rows, V,
+                               static_cast<float>(invtemp), tk_type_name(t));
+  });
+  return {ce, kd, lse_sr, lse_st, lse_t};
+}
+
+static at::Tensor kd_ce_fused_bwd_mps(
+    const at::Tensor& t_in, const at::Tensor& s_in, const at::Tensor& targets_in,
+    const at::Tensor& lse_sr_in, const at::Tensor& lse_st_in, const at::Tensor& lse_t_in,
+    const at::Tensor& go_ce_in, const at::Tensor& go_kd_in, double invtemp) {
+  auto t = t_in.contiguous(), s = s_in.contiguous(), tg = targets_in.contiguous();
+  auto lse_sr = lse_sr_in.contiguous(), lse_st = lse_st_in.contiguous();
+  auto lse_t = lse_t_in.contiguous();
+  auto go_ce = go_ce_in.to(at::kFloat).contiguous();
+  auto go_kd = go_kd_in.to(at::kFloat).contiguous();
+  const int rows = t.size(0), V = t.size(1);
+  auto grad = at::empty_like(s);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kd_ce_fused_bwd(e, t, s, tg, lse_sr, lse_st, lse_t, go_ce, go_kd, grad,
+                               rows, V, static_cast<float>(invtemp), tk_type_name(t));
+  });
+  return grad;
+}
+
 // K2: fused per-token int8 act-quant + W2A8 GEMM. x (M,K) float; wq packed. -> (M,N) half.
 static at::Tensor qgemm_w2a8_fused_mps(const at::Tensor& wq_in, const at::Tensor& x_in) {
   TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
@@ -4681,6 +4723,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Dense-teacher KD-KL backward -> grad_s (MPS)",
         pybind11::arg("t_logits"), pybind11::arg("s_logits"), pybind11::arg("lse_t"),
         pybind11::arg("lse_s"), pybind11::arg("grad_out"), pybind11::arg("invtemp") = 1.0);
+  m.def("kd_ce_fused_fwd", &kd_ce_fused_fwd_mps,
+        "Fused CE + dense-KD forward -> [ce, kd, lse_sr, lse_st, lse_t] (MPS)",
+        pybind11::arg("t_logits"), pybind11::arg("s_logits"), pybind11::arg("targets"),
+        pybind11::arg("invtemp") = 1.0);
+  m.def("kd_ce_fused_bwd", &kd_ce_fused_bwd_mps,
+        "Fused CE + dense-KD backward -> combined grad_s, one pass (MPS)",
+        pybind11::arg("t_logits"), pybind11::arg("s_logits"), pybind11::arg("targets"),
+        pybind11::arg("lse_sr"), pybind11::arg("lse_st"), pybind11::arg("lse_t"),
+        pybind11::arg("go_ce"), pybind11::arg("go_kd"), pybind11::arg("invtemp") = 1.0);
   m.def("qgemm_w2a8_fused", &qgemm_w2a8_fused_mps,
         "BitNet K2: fused per-token int8 act-quant + W2A8 GEMM -> (M,N) half (MPS)");
   m.def("attn_decode", &attn_decode_mps,

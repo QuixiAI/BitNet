@@ -1174,6 +1174,37 @@ void launch_kd_kl_dense_bwd(E& e, typename E::in_t t_logits, typename E::in_t s_
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
+// ----- kd_ce_fused (heal loss, CE + dense-KD in one pair): fwd t@0 s@1 targets@2
+//        -> ce@3 kd@4 lse_sr@5 lse_st@6 lse_t@7 ; V@8 invtemp@9 ; grid (Tn,1,1),
+//        32 thr. bwd: t@0 s@1 targets@2 lse_sr@3 lse_st@4 lse_t@5 go_ce@6 go_kd@7
+//        -> grad_s@8 ; V@9 invtemp@10. -----
+template <class E>
+void launch_kd_ce_fused_fwd(E& e, typename E::in_t t_logits, typename E::in_t s_logits,
+                            typename E::in_t targets, typename E::out_t ce,
+                            typename E::out_t kd, typename E::out_t lse_sr,
+                            typename E::out_t lse_st, typename E::out_t lse_t,
+                            int rows, int V, float invtemp, const std::string& type_name) {
+  e.pipeline("kd_ce_fused_fwd_" + type_name);
+  e.in(t_logits, 0); e.in(s_logits, 1); e.in(targets, 2);
+  e.out(ce, 3); e.out(kd, 4); e.out(lse_sr, 5); e.out(lse_st, 6); e.out(lse_t, 7);
+  e.bytes(V, 8); e.bytes(invtemp, 9);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_kd_ce_fused_bwd(E& e, typename E::in_t t_logits, typename E::in_t s_logits,
+                            typename E::in_t targets, typename E::in_t lse_sr,
+                            typename E::in_t lse_st, typename E::in_t lse_t,
+                            typename E::in_t go_ce, typename E::in_t go_kd,
+                            typename E::out_t grad_s, int rows, int V, float invtemp,
+                            const std::string& type_name) {
+  e.pipeline("kd_ce_fused_bwd_" + type_name);
+  e.in(t_logits, 0); e.in(s_logits, 1); e.in(targets, 2); e.in(lse_sr, 3);
+  e.in(lse_st, 4); e.in(lse_t, 5); e.in(go_ce, 6); e.in(go_kd, 7);
+  e.out(grad_s, 8);
+  e.bytes(V, 9); e.bytes(invtemp, 10);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
 // ----- qgemm_w2a8_fused (K2): D@0(M,N half) Wq@1(packed) X@2(M,K) ; N@3 K@4 ;
 //        grid (M,1,1), 128 thr (4 warps; tg-memory codes; K <= 8192). -----
 template <class E>

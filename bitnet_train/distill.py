@@ -305,6 +305,32 @@ class _FusedKDDense(torch.autograd.Function):
         return g, None, None
 
 
+class _FusedCEKD(torch.autograd.Function):
+    """One kernel pair for CE + dense-KD (the heal loss). fwd shares the
+    student-logit reads between the two losses; bwd emits the COMBINED grad in
+    one pass — no separate CE/KD grads and no autograd grad-add over (T, V)."""
+
+    @staticmethod
+    def forward(ctx, s_logits, t_logits, targets, invtemp):
+        from bitnet_train.bitlinear_metal import _tk
+        ce, kd, lse_sr, lse_st, lse_t = _tk().kd_ce_fused_fwd(
+            t_logits.contiguous(), s_logits.contiguous(), targets.contiguous(),
+            invtemp)
+        ctx.save_for_backward(s_logits, t_logits, targets, lse_sr, lse_st, lse_t)
+        ctx.invtemp = invtemp
+        return ce, kd
+
+    @staticmethod
+    def backward(ctx, go_ce, go_kd):
+        from bitnet_train.bitlinear_metal import _tk
+        s_logits, t_logits, targets, lse_sr, lse_st, lse_t = ctx.saved_tensors
+        g = _tk().kd_ce_fused_bwd(t_logits.contiguous(), s_logits.contiguous(),
+                                  targets, lse_sr, lse_st, lse_t,
+                                  go_ce.contiguous(), go_kd.contiguous(),
+                                  ctx.invtemp)
+        return g, None, None, None
+
+
 # ---------------------------------------------------------------------------
 # teacher + loss computer
 # ---------------------------------------------------------------------------
@@ -374,6 +400,14 @@ class LossComputer:
         for r0 in range(0, T, cfg.tchunk):
             h = hidden[r0:r0 + cfg.tchunk]
             tg = targets[r0:r0 + cfg.tchunk]
+            if fused and cfg.kd_mode == "dense" and teacher_batch is not None:
+                logits = F.linear(h, head_w)
+                t_logits = teacher_batch(slice(r0, r0 + cfg.tchunk))
+                ce_v, kd_v = _FusedCEKD.apply(logits, t_logits.to(logits.dtype),
+                                              tg.int(), 1.0 / cfg.tau)
+                ce_sum = ce_sum + ce_v.float().sum()
+                kd_sum = kd_sum + kd_v.float().sum()
+                continue
             if fused:
                 logits = F.linear(h, head_w)
                 ce_sum = ce_sum + _FusedCE.apply(logits, tg.int()).float().sum()
@@ -381,12 +415,8 @@ class LossComputer:
                 ce_sum = ce_sum + chunked_ce(h, head_w, tg, cfg.vchunk).sum()
             if cfg.kd_mode == "dense" and teacher_batch is not None:
                 t_logits = teacher_batch(slice(r0, r0 + cfg.tchunk))
-                if fused:
-                    kd_sum = kd_sum + _FusedKDDense.apply(
-                        logits, t_logits.to(logits.dtype), 1.0 / cfg.tau).float().sum()
-                else:
-                    kd_sum = kd_sum + chunked_kd_dense(h, head_w, t_logits,
-                                                       cfg.tau, cfg.vchunk).sum()
+                kd_sum = kd_sum + chunked_kd_dense(h, head_w, t_logits,
+                                                   cfg.tau, cfg.vchunk).sum()
             elif cfg.kd_mode == "topk" and teacher_batch is not None:
                 t_idx, t_prob = teacher_batch
                 ti = t_idx[r0:r0 + cfg.tchunk]

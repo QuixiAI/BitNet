@@ -1,5 +1,5 @@
-# One HF dataset per line: org/repo or org/repo:config (#-comments ok).
-# Heal, do not domain-shift (train_plan §5.5): general/educational web, wiki, code.
-HuggingFaceFW/fineweb-edu:sample-10BT
-wikimedia/wikipedia:20231101.en
-bigcode/the-stack-smol
+# TEMPORARY data mix (2026-07-07): single source, just enough to get an A1 run
+# going and watch it converge. NOT the real heal mix — the real one matches the
+# Llama-3.2 distribution (web-dominant + code + math). Replace before freezing
+# the T1 corpus (§5.5 — freeze once; teacher caches invalidate if data moves).
+HuggingFaceFW/finepdfs:eng_Latn

@@ -158,3 +158,30 @@ def test_fused_matches_chunked_on_mps():
                                    rtol=1e-3, atol=1e-4)
         torch.testing.assert_close(outs[True][1], outs[False][1], rtol=1e-2, atol=1e-3)
         torch.testing.assert_close(outs[True][2], outs[False][2], rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_fused_cekd_ignore_index_on_mps():
+    """IGNORE rows carry no CE loss/grad through the fused CE+KD kernel but the
+    KD term still applies to them (matches LossComputer's chunked semantics)."""
+    dev = "mps"
+    hidden = torch.randn(T, H, device=dev)
+    head_w = torch.randn(V, H, device=dev) * 0.05
+    targets = torch.randint(0, V, (T,), device=dev)
+    targets[::4] = IGNORE
+    t_logits = torch.randn(T, V, device=dev) * 2
+
+    outs = {}
+    for fused in (True, False):
+        h = hidden.detach().clone().requires_grad_(True)
+        w = head_w.detach().clone().requires_grad_(True)
+        lc = LossComputer(LossConfig(kd_mode="dense", tchunk=16, vchunk=128,
+                                     prefer_fused=fused))
+        out = lc(h, w, targets, teacher_batch=lambda sl: t_logits[sl])
+        out["loss"].backward()
+        outs[fused] = (out, h.grad, w.grad)
+    for key in ("loss", "ce", "kd"):
+        torch.testing.assert_close(outs[True][0][key], outs[False][0][key],
+                                   rtol=1e-3, atol=1e-4)
+    torch.testing.assert_close(outs[True][1], outs[False][1], rtol=1e-2, atol=1e-3)
+    torch.testing.assert_close(outs[True][2], outs[False][2], rtol=1e-2, atol=1e-3)

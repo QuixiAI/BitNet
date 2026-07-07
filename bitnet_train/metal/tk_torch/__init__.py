@@ -354,6 +354,23 @@ def kd_kl_dense_bwd(t_logits, s_logits, lse_t, lse_s, grad_out, invtemp=1.0):
     return _ext.kd_kl_dense_bwd(t_logits, s_logits, lse_t, lse_s, grad_out, float(invtemp))
 
 
+def kd_ce_fused_fwd(t_logits, s_logits, targets, invtemp=1.0):
+    """Fused CE + dense-KD forward (the heal loss). One pass computes three online
+    LSEs (student@1 for CE, student@invtemp + teacher@invtemp for KD) + the CE
+    target gather; a second pass accumulates the KL sum. targets int32 (Tn,),
+    < 0 = ignore (CE only). Returns (ce (Tn,), kd (Tn,), lse_sr, lse_st, lse_t).
+    Scale kd/go_kd by alpha*tau^2 yourself. MPS."""
+    return tuple(_ext.kd_ce_fused_fwd(t_logits, s_logits, targets, float(invtemp)))
+
+
+def kd_ce_fused_bwd(t_logits, s_logits, targets, lse_sr, lse_st, lse_t,
+                    go_ce, go_kd, invtemp=1.0):
+    """Backward of kd_ce_fused_fwd -> COMBINED grad wrt student logits in one pass
+    (replaces separate CE bwd + KD bwd + autograd grad-add over (T, V)). MPS."""
+    return _ext.kd_ce_fused_bwd(t_logits, s_logits, targets, lse_sr, lse_st, lse_t,
+                                go_ce, go_kd, float(invtemp))
+
+
 # --- Attention decode (rollout-generate customer; training keeps SDPA) ---
 
 def attn_decode(q, kc, vc):

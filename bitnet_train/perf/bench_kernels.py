@@ -235,6 +235,9 @@ SHAPES = {  # (N, K) weight-matrix shapes: LLM projections + Q-track expert
     "quick": [(768, 2048), (2048, 2048)],
     "comprehensive": [(768, 2048), (2048, 768), (2048, 2048), (4096, 4096),
                       (14336, 4096)],
+    # Llama-3.2-1B heal shapes (a1 profile): q/o 2048x2048, k/v 512x2048,
+    # gate/up 8192x2048, down 2048x8192
+    "a1": [(2048, 2048), (512, 2048), (8192, 2048), (2048, 8192)],
 }
 
 
@@ -247,7 +250,8 @@ def _wq(be, preset, formats):
         Wd = be.arr(W, "f32")
         yield Case("weight_quant", f"N{N}_K{K}", {"N": N, "K": K}, "f32",
                    target=lambda Wd=Wd: be.tk.weight_quant_ternary_pt(Wd)[0],
-                   bytes_moved=N * K * 4 + N * K / 32 * 10,
+                   # read f32 twice (abssum pass + encode pass) + write w_deq f32 + wq
+                   bytes_moved=N * K * (4 + 4 + 4) + N * K / 32 * 10,
                    notes="per-tensor ternary pack (K1/K5)")
 
 
@@ -330,13 +334,71 @@ def _fq(be, preset, formats):
 @register("kd_kl_dense", ["torch"])
 def _kd(be, preset, formats):
     V = 128256
-    for Tn in ({"smoke": [64], "quick": [64, 256],
+    for Tn in ({"smoke": [64], "quick": [64, 256], "a1": [1024],
                 "comprehensive": [64, 256, 512]}[preset]):
         t = be.arr((np.random.randn(Tn, V) * 2).astype(np.float32), "bf16")
         s = be.arr((np.random.randn(Tn, V) * 2).astype(np.float32), "bf16")
-        yield Case("kd_kl_dense", f"T{Tn}_V{V}", {"T": Tn, "V": V}, "bf16",
+        # fwd streams both rows twice (online lse pass + loss pass)
+        yield Case("kd_kl_dense", f"T{Tn}_V{V}_fwd", {"T": Tn, "V": V}, "bf16",
                    target=lambda t=t, s=s: be.tk.kd_kl_dense_fwd(t, s, 0.5)[0],
-                   bytes_moved=Tn * V * 2 * 2, notes="A6b full-KL fwd")
+                   bytes_moved=Tn * V * 2 * 2 * 2, notes="A6b full-KL fwd")
+        loss, lse_t, lse_s = be.tk.kd_kl_dense_fwd(t, s, 0.5)
+        go = be.arr(np.random.rand(Tn).astype(np.float32), "f32")
+        yield Case("kd_kl_dense", f"T{Tn}_V{V}_bwd", {"T": Tn, "V": V}, "bf16",
+                   target=lambda t=t, s=s, lse_t=lse_t, lse_s=lse_s, go=go:
+                       be.tk.kd_kl_dense_bwd(t, s, lse_t, lse_s, go, 0.5),
+                   bytes_moved=Tn * V * 2 * 3,       # read t+s, write grad
+                   notes="A6b full-KL bwd")
+
+
+@register("kd_ce_fused", ["torch"])
+def _cekd(be, preset, formats):
+    V = 128256
+    for Tn in ({"smoke": [64], "quick": [256], "a1": [1024],
+                "comprehensive": [256, 1024]}[preset]):
+        t = be.arr((np.random.randn(Tn, V) * 2).astype(np.float32), "bf16")
+        s = be.arr((np.random.randn(Tn, V) * 2).astype(np.float32), "bf16")
+        tg = be.torch.randint(0, V, (Tn,), device="mps", dtype=be.torch.int32)
+        yield Case("kd_ce_fused", f"T{Tn}_V{V}_fwd", {"T": Tn, "V": V}, "bf16",
+                   target=lambda t=t, s=s, tg=tg:
+                       be.tk.kd_ce_fused_fwd(t, s, tg, 0.5)[0],
+                   baselines={"separate": lambda t=t, s=s, tg=tg: (
+                       be.tk.cross_entropy_fwd(s, tg),
+                       be.tk.kd_kl_dense_fwd(t, s, 0.5))[1][0]},
+                   bytes_moved=Tn * V * 2 * 2, notes="heal-loss fused fwd (1-pass)")
+        ce, kd, lse_sr, lse_st, lse_t = be.tk.kd_ce_fused_fwd(t, s, tg, 0.5)
+        go = be.arr(np.random.rand(Tn).astype(np.float32), "f32")
+
+        def _sep_bwd(t=t, s=s, tg=tg, lse=lse_sr, lse_t=lse_t, lse_s=lse_st, go=go):
+            g1 = be.tk.cross_entropy_bwd(s, tg, lse, go)
+            g2 = be.tk.kd_kl_dense_bwd(t, s, lse_t, lse_s, go, 0.5)
+            return g1 + g2                      # the autograd grad-add pass
+        yield Case("kd_ce_fused", f"T{Tn}_V{V}_bwd", {"T": Tn, "V": V}, "bf16",
+                   target=lambda t=t, s=s, tg=tg, a=lse_sr, b=lse_st, c=lse_t, go=go:
+                       be.tk.kd_ce_fused_bwd(t, s, tg, a, b, c, go, go, 0.5),
+                   baselines={"separate": _sep_bwd},
+                   bytes_moved=Tn * V * 2 * 3, notes="heal-loss fused bwd")
+
+
+@register("cross_entropy", ["torch"])
+def _ce(be, preset, formats):
+    V = 128256
+    for Tn in ({"smoke": [64], "quick": [256], "a1": [1024],
+                "comprehensive": [256, 1024]}[preset]):
+        lg = be.arr((np.random.randn(Tn, V) * 2).astype(np.float32), "bf16")
+        tg = be.torch.randint(0, V, (Tn,), device="mps", dtype=be.torch.int32)
+        yield Case("cross_entropy", f"T{Tn}_V{V}_fwd", {"T": Tn, "V": V}, "bf16",
+                   target=lambda lg=lg, tg=tg: be.tk.cross_entropy_fwd(lg, tg)[0],
+                   baselines={"torch_ce": lambda lg=lg, tg=tg:
+                              be.torch.nn.functional.cross_entropy(
+                                  lg.float(), tg.long(), reduction="none")},
+                   bytes_moved=Tn * V * 2, notes="fused CE fwd")
+        loss, lse = be.tk.cross_entropy_fwd(lg, tg)
+        go = be.arr(np.random.rand(Tn).astype(np.float32), "f32")
+        yield Case("cross_entropy", f"T{Tn}_V{V}_bwd", {"T": Tn, "V": V}, "bf16",
+                   target=lambda lg=lg, tg=tg, lse=lse, go=go:
+                       be.tk.cross_entropy_bwd(lg, tg, lse, go),
+                   bytes_moved=Tn * V * 2 * 2, notes="fused CE bwd")
 
 
 @register("ternary_stats", ["torch"])
@@ -522,7 +584,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["torch", "cpu"], default="torch")
-    ap.add_argument("--preset", choices=["smoke", "quick", "comprehensive"],
+    ap.add_argument("--preset", choices=["smoke", "quick", "comprehensive", "a1"],
                     default="quick")
     ap.add_argument("--kernel", default="all")
     ap.add_argument("--formats", default=None)
