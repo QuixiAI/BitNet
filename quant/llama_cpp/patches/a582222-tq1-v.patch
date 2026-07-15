@@ -1,0 +1,1149 @@
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index e3e067c91..bcb28889e 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -122,6 +122,19 @@ extern "C" {
+ 
+     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
+ 
++    // Tensor-local decode state for TQ1_V. Model loaders own this object and
++    // attach it to a CPU-resident packed weight through tensor->extra.
++    struct ggml_tq1_tensor_context {
++        uint32_t magic;
++        uint32_t index_count;
++        const int8_t * codebook; // [index_count, 8], expanded exact trits
++        const uint8_t * legal;   // [index_count], zero marks a reserved alias
++    };
++
++    #define GGML_TQ1_CONTEXT_MAGIC 0x31515442u
++
++    GGML_BACKEND_API bool ggml_cpu_validate_tq1_tensor(const struct ggml_tensor * tensor);
++
+     GGML_BACKEND_API void ggml_cpu_init(void);
+ 
+     //
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 92ba65222..3473b4403 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -430,7 +430,12 @@ extern "C" {
+         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
+         GGML_TYPE_Q1_0    = 41,
+         GGML_TYPE_Q2_0    = 42,
+-        GGML_TYPE_COUNT   = 43,
++        GGML_TYPE_TQ1_V11        = 43,
++        GGML_TYPE_TQ1_V12        = 44,
++        GGML_TYPE_TQ1_V11_R      = 45,
++        GGML_TYPE_TQ1_V12_R      = 46,
++        GGML_TYPE_TQ1_V11_J_A4_R = 47,
++        GGML_TYPE_COUNT           = 48,
+     };
+ 
+     // precision
+diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
+index 83f9118da..017409971 100644
+--- a/ggml/src/ggml-common.h
++++ b/ggml/src/ggml-common.h
+@@ -287,6 +287,37 @@ typedef struct {
+ } block_tq2_0;
+ static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+ 
++// BitNet TQ1_V format version 1. Indices address a model-embedded codebook of
++// eight-trit vectors. The *_R variants use a companion output-row scale tensor;
++// the generic variants carry one FP16 scale per 256-weight block.
++typedef struct {
++    ggml_half d;
++    uint8_t qs[44];
++} block_tq1_v11;
++static_assert(sizeof(block_tq1_v11) == 46, "wrong tq1_v11 block size/padding");
++
++typedef struct {
++    ggml_half d;
++    uint8_t qs[48];
++} block_tq1_v12;
++static_assert(sizeof(block_tq1_v12) == 50, "wrong tq1_v12 block size/padding");
++
++typedef struct {
++    uint8_t qs[44];
++} block_tq1_v11_r;
++static_assert(sizeof(block_tq1_v11_r) == 44, "wrong tq1_v11_r block size/padding");
++
++typedef struct {
++    uint8_t qs[48];
++} block_tq1_v12_r;
++static_assert(sizeof(block_tq1_v12_r) == 48, "wrong tq1_v12_r block size/padding");
++
++typedef struct {
++    uint8_t qs[44];
++    uint8_t affine[4];
++} block_tq1_v11_j_a4_r;
++static_assert(sizeof(block_tq1_v11_j_a4_r) == 48, "wrong tq1_v11_j_a4_r block size/padding");
++
+ //
+ // Super-block quantization structures
+ //
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 0b8d9fac6..7c0e90b06 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -409,6 +409,26 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+         .vec_dot_type             = GGML_TYPE_Q8_K,
+         .nrows                    = 1,
+     },
++    [GGML_TYPE_TQ1_V11] = {
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_TQ1_V12] = {
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_TQ1_V11_R] = {
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_TQ1_V12_R] = {
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
++    [GGML_TYPE_TQ1_V11_J_A4_R] = {
++        .vec_dot_type             = GGML_TYPE_F32,
++        .nrows                    = 1,
++    },
+     [GGML_TYPE_I32] = {
+         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
+     },
+@@ -1161,6 +1181,228 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+ 
+ // ggml_compute_forward_mul_mat
+ 
++static bool ggml_type_is_tq1_v(enum ggml_type type) {
++    return type == GGML_TYPE_TQ1_V11 || type == GGML_TYPE_TQ1_V12 ||
++           type == GGML_TYPE_TQ1_V11_R || type == GGML_TYPE_TQ1_V12_R ||
++           type == GGML_TYPE_TQ1_V11_J_A4_R;
++}
++
++static uint32_t ggml_tq1_v_index(const uint8_t * block, int offset, int high_bits, int group) {
++    const uint8_t * low = block + offset;
++    const uint8_t * high = low + 32;
++    const int bit = group * high_bits;
++    const int byte = bit >> 3;
++    const int shift = bit & 7;
++    uint32_t word = high[byte];
++    const int high_bytes = high_bits * 4;
++    if (byte + 1 < high_bytes) {
++        word |= (uint32_t) high[byte + 1] << 8;
++    }
++    return (uint32_t) low[group] |
++           (((word >> shift) & ((1u << high_bits) - 1u)) << 8);
++}
++
++bool ggml_cpu_validate_tq1_tensor(const struct ggml_tensor * tensor) {
++    if (tensor == NULL || !ggml_type_is_tq1_v(tensor->type) || tensor->data == NULL ||
++        tensor->ne[0] <= 0 || tensor->ne[0] % QK_K != 0 || !ggml_is_contiguous(tensor)) {
++        return false;
++    }
++    const struct ggml_tq1_tensor_context * tq1 =
++        (const struct ggml_tq1_tensor_context *) tensor->extra;
++    if (tq1 == NULL || tq1->magic != GGML_TQ1_CONTEXT_MAGIC ||
++        tq1->codebook == NULL || tq1->legal == NULL) {
++        return false;
++    }
++    const bool v11 = tensor->type == GGML_TYPE_TQ1_V11 ||
++                     tensor->type == GGML_TYPE_TQ1_V11_R ||
++                     tensor->type == GGML_TYPE_TQ1_V11_J_A4_R;
++    const bool row_mode = tensor->type == GGML_TYPE_TQ1_V11_R ||
++                          tensor->type == GGML_TYPE_TQ1_V12_R ||
++                          tensor->type == GGML_TYPE_TQ1_V11_J_A4_R;
++    const bool affine = tensor->type == GGML_TYPE_TQ1_V11_J_A4_R;
++    const int high_bits = v11 ? 3 : 4;
++    const int raw_bytes = v11 ? 44 : 48;
++    const int block_bytes = (int) ggml_type_size(tensor->type);
++    const int index_offset = row_mode ? 0 : 2;
++    const uint32_t index_count = 1u << (high_bits + 8);
++    if (tq1->index_count != index_count) return false;
++    const int64_t block_count = ggml_nelements(tensor) / QK_K;
++    const uint8_t * data = (const uint8_t *) tensor->data;
++    for (int64_t b = 0; b < block_count; ++b) {
++        const uint8_t * block = data + b * block_bytes;
++        if (!row_mode) {
++            const ggml_fp16_t raw_scale = (ggml_fp16_t) block[0] |
++                                          (ggml_fp16_t) ((uint16_t) block[1] << 8);
++            const float scale = GGML_CPU_FP16_TO_FP32(raw_scale);
++            if (!isfinite(scale) || scale < 0.0f) return false;
++        }
++        for (int group = 0; group < 32; ++group) {
++            const uint32_t index = ggml_tq1_v_index(block, index_offset, high_bits, group);
++            if (index >= index_count || !tq1->legal[index]) return false;
++        }
++        if (affine) {
++            for (int byte = 0; byte < 4; ++byte) {
++                if ((block[raw_bytes + byte] & 15) > 11 ||
++                    (block[raw_bytes + byte] >> 4) > 11) return false;
++            }
++        }
++    }
++    return true;
++}
++
++static int8_t ggml_tq1_v_round_even(float value) {
++    float lower = floorf(value);
++    const float fraction = value - lower;
++    if (fraction > 0.5f || (fraction == 0.5f && fmodf(fabsf(lower), 2.0f) == 1.0f)) {
++        lower += 1.0f;
++    }
++    if (lower > 127.0f) lower = 127.0f;
++    if (lower < -127.0f) lower = -127.0f;
++    return (int8_t) lower;
++}
++
++static void ggml_compute_forward_mul_mat_tq1_v(
++        const struct ggml_compute_params * params,
++              struct ggml_tensor * dst) {
++    const struct ggml_tensor * src0 = dst->src[0];
++    const struct ggml_tensor * src1 = dst->src[1];
++    GGML_TENSOR_BINARY_OP_LOCALS
++
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(ne00 == ne10 && ne00 % QK_K == 0);
++    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
++    GGML_ASSERT(nb10 == sizeof(float));
++    GGML_ASSERT(nb0 == sizeof(float));
++
++    const struct ggml_tq1_tensor_context * tq1 =
++        (const struct ggml_tq1_tensor_context *) src0->extra;
++    GGML_ASSERT(tq1 != NULL && tq1->magic == GGML_TQ1_CONTEXT_MAGIC);
++    GGML_ASSERT(tq1->codebook != NULL && tq1->legal != NULL);
++
++    const bool v11 = src0->type == GGML_TYPE_TQ1_V11 ||
++                     src0->type == GGML_TYPE_TQ1_V11_R ||
++                     src0->type == GGML_TYPE_TQ1_V11_J_A4_R;
++    const bool row_mode = src0->type == GGML_TYPE_TQ1_V11_R ||
++                          src0->type == GGML_TYPE_TQ1_V12_R ||
++                          src0->type == GGML_TYPE_TQ1_V11_J_A4_R;
++    const bool affine = src0->type == GGML_TYPE_TQ1_V11_J_A4_R;
++    const int high_bits = v11 ? 3 : 4;
++    const int raw_bytes = v11 ? 44 : 48;
++    const int block_bytes = (int) ggml_type_size(src0->type);
++    const int index_offset = row_mode ? 0 : 2;
++    GGML_ASSERT(tq1->index_count == (uint32_t) (1u << (high_bits + 8)));
++
++    const int64_t activation_rows = ne11 * ne12 * ne13;
++    const size_t qbytes = (size_t) activation_rows * ne10;
++    const size_t scale_offset = (qbytes + sizeof(float) - 1) & ~(sizeof(float) - 1);
++    GGML_ASSERT(params->wdata != NULL);
++    GGML_ASSERT(params->wsize >= scale_offset + (size_t) activation_rows * sizeof(float));
++    int8_t * qdata = (int8_t *) params->wdata;
++    float * scales = (float *) ((uint8_t *) params->wdata + scale_offset);
++
++    // Quantize each logical token exactly once, then share it across all output rows.
++    for (int64_t ar = params->ith; ar < activation_rows; ar += params->nth) {
++        const int64_t i11 = ar % ne11;
++        const int64_t rem = ar / ne11;
++        const int64_t i12 = rem % ne12;
++        const int64_t i13 = rem / ne12;
++        const float * x = (const float *) ((const char *) src1->data +
++            i11 * nb11 + i12 * nb12 + i13 * nb13);
++        float maximum = 0.0f;
++        for (int64_t k = 0; k < ne10; ++k) {
++            GGML_ASSERT(isfinite(x[k]));
++            const float value = fabsf(x[k]);
++            if (value > maximum) maximum = value;
++        }
++        const float scale = maximum / 127.0f;
++        int8_t * q = qdata + ar * ne10;
++        for (int64_t k = 0; k < ne10; ++k) {
++            q[k] = scale > 0.0f ? ggml_tq1_v_round_even(x[k] / scale) : 0;
++        }
++        scales[ar] = scale;
++    }
++    ggml_barrier(params->threadpool);
++
++    const int64_t r2 = ne12 / ne02;
++    const int64_t r3 = ne13 / ne03;
++    const int64_t result_count = ne01 * activation_rows;
++    const int64_t blocks_per_row = ne00 / QK_K;
++    for (int64_t task = params->ith; task < result_count; task += params->nth) {
++        const int64_t n = task % ne01;
++        const int64_t ar = task / ne01;
++        const int64_t i11 = ar % ne11;
++        const int64_t rem = ar / ne11;
++        const int64_t i12 = rem % ne12;
++        const int64_t i13 = rem / ne12;
++        const int64_t i02 = i12 / r2;
++        const int64_t i03 = i13 / r3;
++        const uint8_t * row = (const uint8_t *) src0->data +
++            n * nb01 + i02 * nb02 + i03 * nb03;
++        const int8_t * q = qdata + ar * ne10;
++        int64_t integer_acc = 0;
++        int64_t affine_numerator = 0;
++        float block_acc = 0.0f;
++
++        for (int64_t b = 0; b < blocks_per_row; ++b) {
++            const uint8_t * block = row + b * block_bytes;
++            int64_t current = 0;
++            if (affine) {
++                for (int sub = 0; sub < 8; ++sub) {
++                    int64_t dot = 0;
++                    int64_t xsum = 0;
++                    for (int extra = 0; extra < 4; ++extra) {
++                        const int group = sub * 4 + extra;
++                        const uint32_t index = ggml_tq1_v_index(block, index_offset, high_bits, group);
++                        GGML_ASSERT(index < tq1->index_count && tq1->legal[index]);
++                        const int8_t * code = tq1->codebook + (size_t) index * 8;
++                        const int8_t * qa = q + b * QK_K + group * 8;
++                        for (int lane = 0; lane < 8; ++lane) {
++                            dot += (int32_t) qa[lane] * code[lane];
++                            xsum += qa[lane];
++                        }
++                    }
++                    const uint8_t byte = block[raw_bytes + (sub >> 1)];
++                    const uint8_t nibble = (sub & 1) ? byte >> 4 : byte & 15;
++                    const int mu_id = (nibble >> 2) & 3;
++                    GGML_ASSERT(nibble <= 11 && mu_id != 3);
++                    const int rho_num = 6 + (nibble & 3);
++                    const int mu_num = mu_id == 0 ? 0 : (mu_id == 1 ? 1 : -1);
++                    affine_numerator += (int64_t) rho_num * (8 * dot + mu_num * xsum);
++                }
++                continue;
++            }
++            for (int group = 0; group < 32; ++group) {
++                const uint32_t index = ggml_tq1_v_index(block, index_offset, high_bits, group);
++                GGML_ASSERT(index < tq1->index_count && tq1->legal[index]);
++                const int8_t * code = tq1->codebook + (size_t) index * 8;
++                const int8_t * qa = q + b * QK_K + group * 8;
++                for (int lane = 0; lane < 8; ++lane) {
++                    current += (int32_t) qa[lane] * code[lane];
++                }
++            }
++            if (row_mode) {
++                integer_acc += current;
++            } else {
++                const ggml_fp16_t raw_scale = (ggml_fp16_t) block[0] |
++                                              (ggml_fp16_t) ((uint16_t) block[1] << 8);
++                const float weight_scale = GGML_CPU_FP16_TO_FP32(raw_scale);
++                GGML_ASSERT(isfinite(weight_scale) && weight_scale >= 0.0f);
++                block_acc += weight_scale * (float) current;
++            }
++        }
++        float value;
++        if (affine) {
++            value = scales[ar] * ((float) affine_numerator / 64.0f);
++        } else if (row_mode) {
++            value = scales[ar] * (float) integer_acc;
++        } else {
++            value = scales[ar] * block_acc;
++        }
++        GGML_ASSERT(isfinite(value));
++        *(float *) ((char *) dst->data + n * nb0 + i11 * nb1 + i12 * nb2 + i13 * nb3) = value;
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_one_chunk(
+     const struct ggml_compute_params * params,
+     struct ggml_tensor * dst,
+@@ -1264,6 +1506,11 @@ void ggml_compute_forward_mul_mat(
+         return;
+     }
+ 
++    if (ggml_type_is_tq1_v(src0->type)) {
++        ggml_compute_forward_mul_mat_tq1_v(params, dst);
++        return;
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const int ith = params->ith;
+@@ -2832,10 +3079,15 @@ struct ggml_cplan ggml_graph_plan(
+                     } break;
+                 case GGML_OP_MUL_MAT:
+                     {
+-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
+-
+-                        if (node->src[1]->type != vec_dot_type) {
+-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
++                        if (ggml_type_is_tq1_v(node->src[0]->type)) {
++                            const size_t qbytes = (size_t) ggml_nelements(node->src[1]);
++                            const size_t scale_offset = (qbytes + sizeof(float) - 1) & ~(sizeof(float) - 1);
++                            cur = scale_offset + (size_t) (ggml_nelements(node->src[1]) / node->src[1]->ne[0]) * sizeof(float);
++                        } else {
++                            const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
++                            if (node->src[1]->type != vec_dot_type) {
++                                cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
++                            }
+                         }
+                     } break;
+                 case GGML_OP_MUL_MAT_ID:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 8022ab49d..dfde9d32a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -5795,6 +5795,11 @@ void ggml_compute_forward_clamp(
+         case GGML_TYPE_Q6_K:
+         case GGML_TYPE_TQ1_0:
+         case GGML_TYPE_TQ2_0:
++        case GGML_TYPE_TQ1_V11:
++        case GGML_TYPE_TQ1_V12:
++        case GGML_TYPE_TQ1_V11_R:
++        case GGML_TYPE_TQ1_V12_R:
++        case GGML_TYPE_TQ1_V11_J_A4_R:
+         case GGML_TYPE_IQ2_XXS:
+         case GGML_TYPE_IQ2_XS:
+         case GGML_TYPE_IQ3_XXS:
+diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
+index 1ebc50a76..3ca0ebab1 100644
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -5604,6 +5604,31 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+             {
+                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+             } break;
++        case GGML_TYPE_TQ1_V11:
++            {
++                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq1_v11, data, nb);
++            } break;
++        case GGML_TYPE_TQ1_V12:
++            {
++                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq1_v12, data, nb);
++            } break;
++        case GGML_TYPE_TQ1_V11_R:
++        case GGML_TYPE_TQ1_V12_R:
++            // External row scales and model-local legal indices are validated
++            // by the TQ1 loader/runtime binding.
++            break;
++        case GGML_TYPE_TQ1_V11_J_A4_R:
++            {
++                const block_tq1_v11_j_a4_r * q = (const block_tq1_v11_j_a4_r *) data;
++                for (size_t i = 0; i < nb; ++i) {
++                    for (int byte = 0; byte < 4; ++byte) {
++                        if ((q[i].affine[byte] & 15) > 11 || (q[i].affine[byte] >> 4) > 11) {
++                            fprintf(stderr, "%s: reserved TQ1 A4 metadata at block %zu\n", __func__, i);
++                            return false;
++                        }
++                    }
++                }
++            } break;
+         case GGML_TYPE_IQ1_S:
+             {
+                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq1_s, data, nb);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 086b6ab08..dc1d8f69d 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -924,6 +924,36 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+         .to_float                 = (ggml_to_float_t) dequantize_row_tq2_0,
+         .from_float_ref           = (ggml_from_float_t) quantize_row_tq2_0_ref,
+     },
++    [GGML_TYPE_TQ1_V11] = {
++        .type_name                = "tq1_v11",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_tq1_v11),
++        .is_quantized             = true,
++    },
++    [GGML_TYPE_TQ1_V12] = {
++        .type_name                = "tq1_v12",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_tq1_v12),
++        .is_quantized             = true,
++    },
++    [GGML_TYPE_TQ1_V11_R] = {
++        .type_name                = "tq1_v11_r",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_tq1_v11_r),
++        .is_quantized             = true,
++    },
++    [GGML_TYPE_TQ1_V12_R] = {
++        .type_name                = "tq1_v12_r",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_tq1_v12_r),
++        .is_quantized             = true,
++    },
++    [GGML_TYPE_TQ1_V11_J_A4_R] = {
++        .type_name                = "tq1_v11_j_a4_r",
++        .blck_size                = QK_K,
++        .type_size                = sizeof(block_tq1_v11_j_a4_r),
++        .is_quantized             = true,
++    },
+     [36] = { // GGML_TYPE_IQ4_NL_4_4
+         .type_name                = "TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking",
+         .blck_size                = 0,
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 63ac2ed1f..73cfa5375 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -4567,6 +4567,11 @@ class GGMLQuantizationType(IntEnum):
+     NVFP4   = 40
+     Q1_0    = 41
+     Q2_0    = 42
++    TQ1_V11        = 43
++    TQ1_V12        = 44
++    TQ1_V11_R      = 45
++    TQ1_V12_R      = 46
++    TQ1_V11_J_A4_R = 47
+ 
+ 
+ class ExpertGatingFuncType(IntEnum):
+@@ -4749,6 +4754,11 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
+     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
+     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
++    GGMLQuantizationType.TQ1_V11:        (256, 46),
++    GGMLQuantizationType.TQ1_V12:        (256, 50),
++    GGMLQuantizationType.TQ1_V11_R:      (256, 44),
++    GGMLQuantizationType.TQ1_V12_R:      (256, 48),
++    GGMLQuantizationType.TQ1_V11_J_A4_R: (256, 48),
+ }
+ 
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c8ecb0a28..6976f28b0 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1386,7 +1386,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+ 
+     if (w_s) {
+-        res = ggml_mul(ctx0, res, w_s);
++        const bool tq1_row = w->type == GGML_TYPE_TQ1_V11_R ||
++                             w->type == GGML_TYPE_TQ1_V12_R ||
++                             w->type == GGML_TYPE_TQ1_V11_J_A4_R;
++        ggml_tensor * scale = tq1_row && w_s->type != GGML_TYPE_F32 ?
++            ggml_cast(ctx0, w_s, GGML_TYPE_F32) : w_s;
++        res = ggml_mul(ctx0, res, scale);
+     }
+ 
+     for (const auto & lora : *loras) {
+@@ -1608,7 +1613,13 @@ ggml_tensor * llm_graph_context::build_ffn(
+     }
+ 
+     if (up_s) {
+-        tmp = ggml_mul(ctx0, tmp, up_s);
++        const bool tq1_row = up && (
++            up->type == GGML_TYPE_TQ1_V11_R ||
++            up->type == GGML_TYPE_TQ1_V12_R ||
++            up->type == GGML_TYPE_TQ1_V11_J_A4_R);
++        ggml_tensor * scale = tq1_row && up_s->type != GGML_TYPE_F32 ?
++            ggml_cast(ctx0, up_s, GGML_TYPE_F32) : up_s;
++        tmp = ggml_mul(ctx0, tmp, scale);
+         cb(tmp, "ffn_up_s", il);
+     }
+ 
+@@ -1632,7 +1643,13 @@ ggml_tensor * llm_graph_context::build_ffn(
+         }
+ 
+         if (gate_s) {
+-            cur = ggml_mul(ctx0, cur, gate_s);
++            const bool tq1_row = gate && (
++                gate->type == GGML_TYPE_TQ1_V11_R ||
++                gate->type == GGML_TYPE_TQ1_V12_R ||
++                gate->type == GGML_TYPE_TQ1_V11_J_A4_R);
++            ggml_tensor * scale = tq1_row && gate_s->type != GGML_TYPE_F32 ?
++                ggml_cast(ctx0, gate_s, GGML_TYPE_F32) : gate_s;
++            cur = ggml_mul(ctx0, cur, scale);
+             cb(cur, "ffn_gate_s", il);
+         }
+ 
+@@ -1745,7 +1762,13 @@ ggml_tensor * llm_graph_context::build_ffn(
+     }
+ 
+     if (down_s) {
+-        cur = ggml_mul(ctx0, cur, down_s);
++        const bool tq1_row = down && (
++            down->type == GGML_TYPE_TQ1_V11_R ||
++            down->type == GGML_TYPE_TQ1_V12_R ||
++            down->type == GGML_TYPE_TQ1_V11_J_A4_R);
++        ggml_tensor * scale = tq1_row && down_s->type != GGML_TYPE_F32 ?
++            ggml_cast(ctx0, down_s, GGML_TYPE_F32) : down_s;
++        cur = ggml_mul(ctx0, cur, scale);
+         cb(cur, "ffn_down_s", il);
+     }
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 28f8bb793..a3faa2849 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-model-loader.h"
+ 
+ #include "ggml-alloc.h"
++#include "ggml-cpu.h"
+ #include "ggml.h"
+ #include "gguf.h"
+ #include "llama-hparams.h"
+@@ -398,6 +399,7 @@ namespace GGUFMeta {
+     }
+ 
+     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
++    template bool llama_model_loader::get_arr<std::string>(const std::string & key, std::vector<std::string> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
+     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
+@@ -427,6 +429,8 @@ namespace GGUFMeta {
+     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
+     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
+     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
++    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result,    bool required);
++    template bool llama_model_loader::get_key<std::string>(const std::string & key, std::string & result, bool required);
+ 
+     template<>
+     bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
+@@ -868,6 +872,18 @@ struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string &
+     return tensor;
+ }
+ 
++std::vector<uint8_t> llama_model_loader::read_aux_tensor(const std::string & name) {
++    const auto & weight = require_weight(name.c_str());
++    const size_t size = ggml_nbytes(weight.tensor);
++    std::vector<uint8_t> result(size);
++    GGML_ASSERT(weight.idx < files.size());
++    const auto & file = files.at(weight.idx);
++    file->seek(weight.offs, SEEK_SET);
++    file->read_raw(result.data(), result.size());
++    n_created++;
++    return result;
++}
++
+ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const {
+     const struct ggml_tensor * cur = get_tensor_meta(name.c_str());
+ 
+@@ -1161,8 +1177,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+ 
+         ggml_backend_buffer_type_t buft = nullptr;
+ 
++        const bool is_tq1_v = t_meta->type == GGML_TYPE_TQ1_V11 ||
++                              t_meta->type == GGML_TYPE_TQ1_V12 ||
++                              t_meta->type == GGML_TYPE_TQ1_V11_R ||
++                              t_meta->type == GGML_TYPE_TQ1_V12_R ||
++                              t_meta->type == GGML_TYPE_TQ1_V11_J_A4_R;
++        if (is_tq1_v) {
++            // Revision 1 exposes only the tensor-bound scalar CPU path. Using
++            // a backend-specific extra buffer would overwrite tensor->extra,
++            // which carries the exact model codebook binding.
++            buft = ggml_backend_cpu_buffer_type();
++            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++            if (!cpu_dev || !weight_buft_supported(hparams, t_meta, op, buft, cpu_dev)) {
++                throw std::runtime_error(format("CPU backend cannot execute TQ1 tensor '%s'", tn.str().c_str()));
++            }
++        }
++
+         // check overrides
+-        if (tensor_buft_overrides) {
++        if (!is_tq1_v && tensor_buft_overrides) {
+             std::string tensor_name = tn.str();
+             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+                 std::regex pattern(overrides->pattern);
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index c476026d3..63b72714e 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -176,6 +176,10 @@ struct llama_model_loader {
+ 
+     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
+ 
++    // Consume a non-graph auxiliary tensor (for example an embedded TQ1
++    // codebook) directly from GGUF while still accounting for tensor inventory.
++    std::vector<uint8_t> read_aux_tensor(const std::string & name);
++
+     const struct ggml_tensor * check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const;
+ 
+     struct ggml_tensor * create_tensor(
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index eaf3f35d2..0b1a75065 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -19,6 +19,7 @@
+ #include "models/models.h"
+ 
+ #include "ggml.h"
++#include "ggml-cpu.h"
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
+@@ -34,6 +35,8 @@
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
++#include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+@@ -980,6 +983,12 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
+     return buft_list;
+ }
+ 
++struct llama_tq1_codebook_data {
++    std::string id;
++    std::vector<int8_t> expanded;
++    std::vector<uint8_t> legal;
++};
++
+ struct llama_model::impl {
+     impl() = default;
+     ~impl() = default;
+@@ -1017,6 +1026,9 @@ struct llama_model::impl {
+     bool has_tensor_overrides;
+ 
+     std::vector<float> tensor_split_owned;
++
++    std::vector<std::unique_ptr<llama_tq1_codebook_data>> tq1_codebooks;
++    std::vector<std::unique_ptr<ggml_tq1_tensor_context>> tq1_bindings;
+ };
+ 
+ llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+@@ -1228,6 +1240,384 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+     vocab.load(ml, kv);
+ }
+ 
++static bool llama_is_tq1_v_type(enum ggml_type type) {
++    return type == GGML_TYPE_TQ1_V11 || type == GGML_TYPE_TQ1_V12 ||
++           type == GGML_TYPE_TQ1_V11_R || type == GGML_TYPE_TQ1_V12_R ||
++           type == GGML_TYPE_TQ1_V11_J_A4_R;
++}
++
++static bool llama_is_tq1_v_row_type(enum ggml_type type) {
++    return type == GGML_TYPE_TQ1_V11_R || type == GGML_TYPE_TQ1_V12_R ||
++           type == GGML_TYPE_TQ1_V11_J_A4_R;
++}
++
++static int64_t llama_tq1_scale_length(const ggml_tensor * weight) {
++    return weight && llama_is_tq1_v_row_type(weight->type) ? weight->ne[1] : 1;
++}
++
++// Compact FIPS 180-4 SHA-256 used to verify model-embedded codebooks without
++// adding a crypto dependency to the model loader.
++static std::string llama_tq1_sha256(const std::vector<uint8_t> & input) {
++    static const uint32_t k[64] = {
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++    };
++    uint32_t state[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
++                         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
++    auto rotr = [](uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
++    auto transform = [&](const uint8_t * block) {
++        uint32_t w[64];
++        for (int i = 0; i < 16; ++i) {
++            w[i] = (uint32_t) block[4*i] << 24 | (uint32_t) block[4*i + 1] << 16 |
++                   (uint32_t) block[4*i + 2] << 8 | block[4*i + 3];
++        }
++        for (int i = 16; i < 64; ++i) {
++            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
++            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
++            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++        }
++        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
++        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
++        for (int i = 0; i < 64; ++i) {
++            const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
++            const uint32_t ch = (e & f) ^ (~e & g);
++            const uint32_t t1 = h + s1 + ch + k[i] + w[i];
++            const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
++            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
++            const uint32_t t2 = s0 + maj;
++            h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++        }
++        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
++        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
++    };
++    size_t offset = 0;
++    while (input.size() - offset >= 64) {
++        transform(input.data() + offset);
++        offset += 64;
++    }
++    uint8_t final_blocks[128] = {};
++    const size_t remain = input.size() - offset;
++    if (remain) std::memcpy(final_blocks, input.data() + offset, remain);
++    final_blocks[remain] = 0x80;
++    const size_t padded = remain < 56 ? 64 : 128;
++    const uint64_t bit_count = (uint64_t) input.size() * 8;
++    for (int i = 0; i < 8; ++i) final_blocks[padded - 1 - i] = (uint8_t) (bit_count >> (8*i));
++    transform(final_blocks);
++    if (padded == 128) transform(final_blocks + 64);
++    static const char hex[] = "0123456789abcdef";
++    std::string result(64, '0');
++    for (int i = 0; i < 8; ++i) {
++        for (int byte = 0; byte < 4; ++byte) {
++            const uint8_t value = (uint8_t) (state[i] >> (24 - 8*byte));
++            result[8*i + 2*byte] = hex[value >> 4];
++            result[8*i + 2*byte + 1] = hex[value & 15];
++        }
++    }
++    return result;
++}
++
++static bool llama_tq1_is_sha256(const std::string & value) {
++    if (value.size() != 64) {
++        return false;
++    }
++    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
++        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
++    });
++}
++
++static std::string llama_tq1_sha256(const std::string & input) {
++    return llama_tq1_sha256(std::vector<uint8_t>(input.begin(), input.end()));
++}
++
++struct llama_tq1_table_data {
++    std::string name;
++    uint8_t dtype_code;
++    std::vector<uint32_t> shape;
++    std::vector<uint8_t> payload;
++};
++
++template<typename T>
++static void llama_tq1_append_le(std::vector<uint8_t> & out, T value) {
++    for (size_t i = 0; i < sizeof(T); ++i) out.push_back((uint8_t) (value >> (8*i)));
++}
++
++static std::string llama_tq1_codebook_sha256(
++        const std::string & index_format,
++        const std::string & encoding,
++        const std::vector<llama_tq1_table_data> & tables) {
++    std::vector<uint8_t> stream;
++    const uint8_t magic[13] = {'T','Q','1','_','C','O','D','E','B','O','O','K',0};
++    stream.insert(stream.end(), magic, magic + 13);
++    llama_tq1_append_le<uint32_t>(stream, 1);
++    llama_tq1_append_le<uint16_t>(stream, (uint16_t) encoding.size());
++    stream.insert(stream.end(), encoding.begin(), encoding.end());
++    llama_tq1_append_le<uint16_t>(stream, (uint16_t) index_format.size());
++    stream.insert(stream.end(), index_format.begin(), index_format.end());
++    llama_tq1_append_le<uint16_t>(stream, (uint16_t) tables.size());
++    for (const auto & table : tables) {
++        llama_tq1_append_le<uint16_t>(stream, (uint16_t) table.name.size());
++        stream.insert(stream.end(), table.name.begin(), table.name.end());
++        stream.push_back(table.dtype_code);
++        stream.push_back((uint8_t) table.shape.size());
++        for (uint32_t dim : table.shape) llama_tq1_append_le<uint32_t>(stream, dim);
++        llama_tq1_append_le<uint64_t>(stream, table.payload.size());
++        stream.insert(stream.end(), table.payload.begin(), table.payload.end());
++    }
++    return llama_tq1_sha256(stream);
++}
++
++void llama_model_base::load_tq1_bindings(llama_model_loader & ml) {
++    std::unordered_map<std::string, ggml_tensor *> custom_tensors;
++    for (auto & [_, ctx_ptr] : ml.ctx_map) {
++        for (ggml_tensor * cur = ggml_get_first_tensor(ctx_ptr.get()); cur; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
++            if (llama_is_tq1_v_type(cur->type)) {
++                custom_tensors.emplace(cur->name, cur);
++            }
++        }
++    }
++    if (custom_tensors.empty()) {
++        return;
++    }
++
++    std::string spec_revision;
++    std::string quant_spec_json;
++    std::string quant_spec_sha256;
++    uint32_t format_version = 0;
++    uint32_t registry_revision = 0;
++    ml.get_key("tq1.spec_revision", spec_revision);
++    ml.get_key("tq1.format_version", format_version);
++    ml.get_key("tq1.ggml_type_registry_revision", registry_revision);
++    ml.get_key("tq1.quant_spec_json", quant_spec_json);
++    ml.get_key("tq1.quant_spec_sha256", quant_spec_sha256);
++    if (spec_revision != "1.0.0" || format_version != 1 || registry_revision != 1 ||
++        !llama_tq1_is_sha256(quant_spec_sha256) ||
++        llama_tq1_sha256(quant_spec_json) != quant_spec_sha256) {
++        throw std::runtime_error("unsupported or incomplete TQ1 format identity");
++    }
++
++    std::string source_model;
++    std::string source_revision;
++    ml.get_key("tq1.source_model", source_model);
++    ml.get_key("tq1.source_revision", source_revision);
++    if (source_model.empty() || source_revision.empty()) {
++        throw std::runtime_error("TQ1 model provenance is incomplete");
++    }
++
++    bool strict_ternary = false;
++    ml.get_key("tq1.strict_ternary", strict_ternary);
++
++    std::string activation_mode;
++    ml.get_key("tq1.activation_mode", activation_mode);
++    if (activation_mode != "a8_token") {
++        throw std::runtime_error("TQ1 llama.cpp revision 1 requires activation_mode=a8_token");
++    }
++
++    std::vector<std::string> tensor_names;
++    std::vector<std::string> tensor_codebooks;
++    std::vector<std::string> tensor_profiles;
++    std::vector<std::string> tensor_scales;
++    ml.get_arr("tq1.tensor.names", tensor_names);
++    ml.get_arr("tq1.tensor.codebook_ids", tensor_codebooks);
++    ml.get_arr("tq1.tensor.profiles", tensor_profiles);
++    ml.get_arr("tq1.tensor.scale_names", tensor_scales);
++    if (tensor_names.size() != tensor_codebooks.size() || tensor_names.size() != tensor_profiles.size() ||
++        tensor_names.size() != tensor_scales.size() || tensor_names.size() != custom_tensors.size()) {
++        throw std::runtime_error("TQ1 tensor binding metadata does not match the custom tensor inventory");
++    }
++
++    std::vector<std::string> codebook_ids;
++    uint32_t codebook_count = 0;
++    ml.get_arr("tq1.codebook.ids", codebook_ids);
++    ml.get_key("tq1.codebook.count", codebook_count);
++    if (codebook_ids.size() != codebook_count) {
++        throw std::runtime_error("TQ1 codebook count does not match tq1.codebook.ids");
++    }
++
++    auto read_aux = [&](const std::string & name, std::initializer_list<int64_t> dims) {
++        ggml_tensor * tensor = ml.require_tensor_meta(name);
++        if (tensor->type != GGML_TYPE_I8) {
++            throw std::runtime_error("TQ1 codebook tensor '" + name + "' must be I8");
++        }
++        size_t axis = 0;
++        for (int64_t dim : dims) {
++            if (tensor->ne[axis++] != dim) {
++                throw std::runtime_error("TQ1 codebook tensor '" + name + "' has the wrong shape");
++            }
++        }
++        for (; axis < GGML_MAX_DIMS; ++axis) {
++            if (tensor->ne[axis] != 1) {
++                throw std::runtime_error("TQ1 codebook tensor '" + name + "' has the wrong rank");
++            }
++        }
++        return ml.read_aux_tensor(name);
++    };
++
++    std::unordered_map<std::string, llama_tq1_codebook_data *> books;
++    for (const std::string & id : codebook_ids) {
++        if (books.count(id)) {
++            throw std::runtime_error("duplicate TQ1 codebook id '" + id + "'");
++        }
++        std::string encoding;
++        std::string index_format;
++        const std::string prefix = "tq1.codebook." + id + ".";
++        ml.get_key(prefix + "encoding", encoding);
++        ml.get_key(prefix + "index_format", index_format);
++        const int index_count = index_format == "v11" ? 2048 : index_format == "v12" ? 4096 : 0;
++        if (!index_count) {
++            throw std::runtime_error("invalid TQ1 index format for codebook '" + id + "'");
++        }
++        auto book = std::make_unique<llama_tq1_codebook_data>();
++        book->id = id;
++        book->expanded.resize((size_t) index_count * 8);
++        const std::string tensor_prefix = "__tq1_codebook." + id + ".";
++        std::vector<llama_tq1_table_data> canonical_tables;
++
++        if (encoding == "sign_canonical") {
++            const int count = index_count / 2;
++            const auto positive = read_aux(tensor_prefix + "positive_mask", {count});
++            const auto negative = read_aux(tensor_prefix + "negative_mask", {count});
++            std::vector<uint8_t> masks((size_t) count * 2);
++            for (int shape = 0; shape < count; ++shape) {
++                masks[(size_t) shape * 2] = positive[shape];
++                masks[(size_t) shape * 2 + 1] = negative[shape];
++            }
++            canonical_tables.push_back({"shapes_masks", 1, {(uint32_t) count, 2}, std::move(masks)});
++            for (int index = 0; index < index_count; ++index) {
++                const int shape = index & (count - 1);
++                const int sign = index & count ? -1 : 1;
++                if (positive[shape] & negative[shape]) {
++                    throw std::runtime_error("overlapping TQ1 codebook masks for '" + id + "'");
++                }
++                for (int lane = 0; lane < 8; ++lane) {
++                    const int trit = ((positive[shape] >> lane) & 1) - ((negative[shape] >> lane) & 1);
++                    book->expanded[(size_t) index * 8 + lane] = (int8_t) (sign * trit);
++                }
++            }
++        } else if (encoding == "direct_joint") {
++            if (index_format != "v11") {
++                throw std::runtime_error("direct-joint TQ1 codebooks must use v11");
++            }
++            const auto joint = read_aux(tensor_prefix + "joint_trits", {8, index_count});
++            std::memcpy(book->expanded.data(), joint.data(), joint.size());
++            canonical_tables.push_back({"joint_trits", 2, {(uint32_t) index_count, 8}, joint});
++        } else if (encoding == "product") {
++            const int b_count = index_format == "v11" ? 32 : 64;
++            const auto a = read_aux(tensor_prefix + "product_a", {4, 32});
++            const auto b = read_aux(tensor_prefix + "product_b", {4, b_count});
++            canonical_tables.push_back({"product_a", 2, {32, 4}, a});
++            canonical_tables.push_back({"product_b", 2, {(uint32_t) b_count, 4}, b});
++            const int sign_bit = index_count / 2;
++            for (int index = 0; index < index_count; ++index) {
++                const int a_id = index & 31;
++                const int b_id = (index >> 5) & (b_count - 1);
++                const int sign = index & sign_bit ? -1 : 1;
++                for (int lane = 0; lane < 4; ++lane) {
++                    book->expanded[(size_t) index * 8 + lane] = (int8_t) (sign * (int8_t) a[(size_t) a_id * 4 + lane]);
++                    book->expanded[(size_t) index * 8 + 4 + lane] = (int8_t) (sign * (int8_t) b[(size_t) b_id * 4 + lane]);
++                }
++            }
++        } else {
++            throw std::runtime_error("unsupported TQ1 codebook encoding '" + encoding + "'");
++        }
++
++        std::string expected_sha256;
++        ml.get_key(prefix + "sha256", expected_sha256);
++        if (!llama_tq1_is_sha256(expected_sha256) ||
++            llama_tq1_codebook_sha256(index_format, encoding, canonical_tables) != expected_sha256) {
++            throw std::runtime_error("TQ1 codebook hash mismatch for '" + id + "'");
++        }
++
++        book->legal.assign(index_count, 0);
++        bool seen[6561] = {};
++        static const int powers[8] = {1, 3, 9, 27, 81, 243, 729, 2187};
++        uint32_t legal_count = 0;
++        for (int index = 0; index < index_count; ++index) {
++            int pattern = 0;
++            for (int lane = 0; lane < 8; ++lane) {
++                const int trit = book->expanded[(size_t) index * 8 + lane];
++                if (trit < -1 || trit > 1) {
++                    throw std::runtime_error("non-ternary value in TQ1 codebook '" + id + "'");
++                }
++                pattern += (trit + 1) * powers[lane];
++            }
++            if (!seen[pattern]) {
++                seen[pattern] = true;
++                book->legal[index] = 1;
++                legal_count++;
++            }
++        }
++        uint32_t expected_legal = 0;
++        uint32_t expected_reserved = 0;
++        ml.get_key(prefix + "legal_index_count", expected_legal);
++        ml.get_key(prefix + "reserved_index_count", expected_reserved);
++        if (legal_count != expected_legal || (uint32_t) index_count - legal_count != expected_reserved) {
++            throw std::runtime_error("TQ1 legal-index metadata mismatch for codebook '" + id + "'");
++        }
++        books.emplace(id, book.get());
++        pimpl->tq1_codebooks.emplace_back(std::move(book));
++    }
++
++    std::unordered_set<std::string> bound;
++    bool has_affine = false;
++    for (size_t i = 0; i < tensor_names.size(); ++i) {
++        const std::string & name = tensor_names[i];
++        auto tensor_it = custom_tensors.find(name);
++        auto book_it = books.find(tensor_codebooks[i]);
++        if (tensor_it == custom_tensors.end() || book_it == books.end() || !bound.insert(name).second) {
++            throw std::runtime_error("invalid TQ1 tensor/codebook binding for '" + name + "'");
++        }
++        enum ggml_type expected_type;
++        const std::string & profile = tensor_profiles[i];
++        if (profile == "tq1_v11-j-b") expected_type = GGML_TYPE_TQ1_V11;
++        else if (profile == "tq1_v12-j-b") expected_type = GGML_TYPE_TQ1_V12;
++        else if (profile == "tq1_v11-j-r" || profile == "tq1_v11-i-r" || profile == "tq1_v11-p-r") expected_type = GGML_TYPE_TQ1_V11_R;
++        else if (profile == "tq1_v12-j-r" || profile == "tq1_v12-p-r") expected_type = GGML_TYPE_TQ1_V12_R;
++        else if (profile == "tq1_v11-j-a4-r") {
++            expected_type = GGML_TYPE_TQ1_V11_J_A4_R;
++            has_affine = true;
++        }
++        else throw std::runtime_error("unsupported TQ1 profile '" + profile + "'");
++        if (tensor_it->second->type != expected_type || tensor_it->second->extra != nullptr) {
++            throw std::runtime_error("TQ1 GGML type or backend binding mismatch for '" + name + "'");
++        }
++        const bool row_type = llama_is_tq1_v_row_type(expected_type);
++        if (row_type != !tensor_scales[i].empty()) {
++            throw std::runtime_error("TQ1 companion-scale metadata mismatch for '" + name + "'");
++        }
++        if (row_type) {
++            const std::string expected_scale = name.size() > 7 && name.substr(name.size() - 7) == ".weight" ?
++                name.substr(0, name.size() - 7) + ".scale" : std::string();
++            ggml_tensor * scale = ml.require_tensor_meta(tensor_scales[i]);
++            if (tensor_scales[i] != expected_scale ||
++                (scale->type != GGML_TYPE_F16 && scale->type != GGML_TYPE_BF16) ||
++                scale->ne[0] != tensor_it->second->ne[1] || scale->ne[1] != 1) {
++                throw std::runtime_error("invalid TQ1 row-scale tensor for '" + name + "'");
++            }
++        }
++        const uint32_t profile_count = expected_type == GGML_TYPE_TQ1_V12 || expected_type == GGML_TYPE_TQ1_V12_R ? 4096 : 2048;
++        llama_tq1_codebook_data * book = book_it->second;
++        if (book->legal.size() != profile_count) {
++            throw std::runtime_error("TQ1 codebook width is incompatible with tensor '" + name + "'");
++        }
++        auto binding = std::make_unique<ggml_tq1_tensor_context>();
++        binding->magic = GGML_TQ1_CONTEXT_MAGIC;
++        binding->index_count = profile_count;
++        binding->codebook = book->expanded.data();
++        binding->legal = book->legal.data();
++        tensor_it->second->extra = binding.get();
++        pimpl->tq1_bindings.emplace_back(std::move(binding));
++    }
++    if (strict_ternary == has_affine) {
++        throw std::runtime_error("tq1.strict_ternary does not match the resolved profiles");
++    }
++}
++
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const auto & split_mode   = params.split_mode;
+     const auto & use_mlock    = params.use_mlock;
+@@ -1343,16 +1733,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+             // attention weight scales (per-tensor, shape {1})
+             if (!layer.wq_s && layer.wq) {
+-                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {llama_tq1_scale_length(layer.wq)}, TENSOR_NOT_REQUIRED);
+             }
+             if (!layer.wk_s && layer.wk) {
+-                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {llama_tq1_scale_length(layer.wk)}, TENSOR_NOT_REQUIRED);
+             }
+             if (!layer.wv_s && layer.wv) {
+-                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {llama_tq1_scale_length(layer.wv)}, TENSOR_NOT_REQUIRED);
+             }
+             if (!layer.wo_s && layer.wo) {
+-                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {llama_tq1_scale_length(layer.wo)}, TENSOR_NOT_REQUIRED);
+             }
+             if (!layer.wqkv_s && layer.wqkv) {
+                 layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+@@ -1363,13 +1753,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+             // dense FFN weight scales (per-tensor, shape {1})
+             if (!layer.ffn_gate_s && layer.ffn_gate) {
+-                layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {llama_tq1_scale_length(layer.ffn_gate)}, TENSOR_NOT_REQUIRED);
+             }
+             if (!layer.ffn_down_s && layer.ffn_down) {
+-                layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {llama_tq1_scale_length(layer.ffn_down)}, TENSOR_NOT_REQUIRED);
+             }
+             if (!layer.ffn_up_s && layer.ffn_up) {
+-                layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
++                layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {llama_tq1_scale_length(layer.ffn_up)}, TENSOR_NOT_REQUIRED);
+             }
+             if (!layer.ffn_gate_shexp_s && layer.ffn_gate_shexp) {
+                 layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+@@ -1489,6 +1879,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
++    load_tq1_bindings(ml);
+     ml.done_getting_tensors();
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+@@ -1633,6 +2024,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    for (const auto & [name, tensor] : tensors_by_name) {
++        if (llama_is_tq1_v_type(tensor->type) && !ggml_cpu_validate_tq1_tensor(tensor)) {
++            throw std::runtime_error("invalid packed TQ1 payload for tensor '" + name + "'");
++        }
++    }
++
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {
+             pimpl->mappings.emplace_back(std::move(mapping));
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 45b054ced..69ad410da 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -727,6 +727,7 @@ struct llama_model_base : public llama_model {
+     void load_hparams(llama_model_loader & ml) override;
+     void load_vocab  (llama_model_loader & ml) override;
+     bool load_tensors(llama_model_loader & ml) override;
++    void load_tq1_bindings(llama_model_loader & ml);
+ 
+     // model must define these
+     void load_arch_hparams(llama_model_loader & ml) override = 0;

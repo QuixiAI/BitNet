@@ -445,6 +445,117 @@ def _gemv(be, preset, formats):
                        flops=2 * N * K, notes="A-format decode GEMV")
 
 
+@register("gemv_tq1", ["cpu"])
+def _gemv_tq1(be, preset, formats):
+    """Schema-2 canonical TQ1 decode, including its permanent scalar baseline."""
+    import torch
+    from bitnet_train.tq1.codebook import sign_canonical_codebook
+    from bitnet_train.tq1.packing import pack_payload
+    from bitnet_train.tq1.solver import canonical_shapes
+
+    shapes = canonical_shapes()
+    requested = formats or ["tq1_v11-j-r", "tq1_v12-j-r"]
+    for profile in requested:
+        if profile not in {"tq1_v11-j-r", "tq1_v12-j-r"}:
+            continue
+        count = 1024 if "v11" in profile else 2048
+        book = sign_canonical_codebook(f"bench_{count}",
+                                       "v11" if count == 1024 else "v12",
+                                       torch.cat((shapes[(shapes == 0).all(1)],
+                                                  shapes[~(shapes == 0).all(1)][:count - 1])))
+        expanded = book.decode(torch.arange(book.index_count)).numpy()
+        legal = book.legal_index_mask().numpy()
+        legal_ids = np.flatnonzero(legal)
+        for N, K in SHAPES[preset]:
+            if K % 256:
+                continue
+            idx = torch.from_numpy(np.random.choice(
+                legal_ids, size=(N, K // 8), replace=True).astype(np.int64))
+            payload = pack_payload(idx, profile).numpy()
+            scales = (np.random.random(N).astype(np.float32) * 0.1).astype(np.float16)
+            xq, act_scale = act_q(np.random.randn(K).astype(np.float32))
+            act = np.asarray([act_scale], np.float32)
+            integer = (expanded[idx.numpy()].reshape(N, K).astype(np.int32)
+                       @ xq.astype(np.int32))
+            ref = integer.astype(np.float64) * float(act_scale) * scales.astype(np.float64)
+            dense = expanded[idx.numpy()].reshape(N, K).astype(np.float32) \
+                    * scales.astype(np.float32)[:, None]
+            args = (payload, scales, expanded, legal, xq, act, profile)
+            yield Case(
+                "gemv_tq1", f"N{N}_K{K}_{profile}", {"N": N, "K": K}, "i8",
+                fmt=profile,
+                target=lambda args=args: be.bn.gemv_tq1(*args, impl="auto"),
+                baselines={
+                    "scalar": lambda args=args: be.bn.gemv_tq1(*args, impl="scalar"),
+                    "dequant_matmul": lambda dense=dense, xq=xq, act_scale=act_scale:
+                        dense @ (xq.astype(np.float32) * act_scale),
+                },
+                ref=ref, weight_bytes=payload.nbytes, flops=2 * N * K,
+                notes=(f"canonical payload; expanded codebook resident "
+                       f"{expanded.nbytes + legal.nbytes} B; scalar oracle retained"))
+
+
+@register("gemm_tq1", ["cpu"])
+def _gemm_tq1(be, preset, formats):
+    """Packed TQ1 small-batch/prefill path, measured separately from decode."""
+    import torch
+    from bitnet_train.tq1.codebook import sign_canonical_codebook
+    from bitnet_train.tq1.packing import pack_payload
+    from bitnet_train.tq1.solver import canonical_shapes
+
+    shapes = canonical_shapes()
+    requested = formats or ["tq1_v11-j-r", "tq1_v12-j-r"]
+    token_counts = {
+        "smoke": [4], "quick": [4, 16], "a1": [4, 32],
+        "comprehensive": [4, 16, 64],
+    }[preset]
+    for profile in requested:
+        if profile not in {"tq1_v11-j-r", "tq1_v12-j-r"}:
+            continue
+        count = 1024 if "v11" in profile else 2048
+        book = sign_canonical_codebook(
+            f"bench_gemm_{count}", "v11" if count == 1024 else "v12",
+            torch.cat((shapes[(shapes == 0).all(1)],
+                       shapes[~(shapes == 0).all(1)][:count - 1])))
+        expanded = book.decode(torch.arange(book.index_count)).numpy()
+        legal = book.legal_index_mask().numpy()
+        legal_ids = np.flatnonzero(legal)
+        for N, K in SHAPES[preset]:
+            if K % 256:
+                continue
+            idx = torch.from_numpy(np.random.choice(
+                legal_ids, size=(N, K // 8), replace=True).astype(np.int64))
+            payload = pack_payload(idx, profile).numpy()
+            scales = (np.random.random(N).astype(np.float32) * 0.1).astype(np.float16)
+            codes = expanded[idx.numpy()].reshape(N, K)
+            dense = codes.astype(np.float32) * scales.astype(np.float32)[:, None]
+            for M in token_counts:
+                quantized = [act_q(np.random.randn(K).astype(np.float32)) for _ in range(M)]
+                xq = np.stack([item[0] for item in quantized])
+                act = np.asarray([[item[1]] for item in quantized], np.float32)
+                integer = xq.astype(np.int32) @ codes.astype(np.int32).T
+                ref = integer.astype(np.float64) * act.astype(np.float64) \
+                    * scales.astype(np.float64)[None]
+                args = (payload, scales, expanded, legal, xq, act, profile)
+                yield Case(
+                    "gemm_tq1", f"M{M}_N{N}_K{K}_{profile}",
+                    {"M": M, "N": N, "K": K}, "i8", fmt=profile,
+                    target=lambda args=args: be.bn.gemm_tq1(*args, impl="auto"),
+                    baselines={
+                        "repeated_gemv": lambda payload=payload, scales=scales,
+                        expanded=expanded, legal=legal, xq=xq, act=act,
+                        profile=profile: np.stack([
+                            be.bn.gemv_tq1(
+                                payload, scales, expanded, legal, xq[m], act[m],
+                                profile, impl="auto") for m in range(xq.shape[0])]),
+                        "dequant_matmul": lambda dense=dense, xq=xq, act=act:
+                            (xq.astype(np.float32) * act) @ dense.T,
+                    },
+                    ref=ref, weight_bytes=payload.nbytes, flops=2 * M * N * K,
+                    notes=("small-batch/prefill; one native dispatch; canonical "
+                           "payload and expanded codebook resident"))
+
+
 @register("gemv_tl1", ["cpu"])
 def _tl1(be, preset, formats):
     for N, K in SHAPES[preset]:

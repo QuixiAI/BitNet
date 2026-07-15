@@ -18,20 +18,52 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from bitnet_train.cpu import bitnet_cpu as bn
 
 
-def pack_bitnet_np(W, per_tensor=True):
+def _baked_scales(Wb, per_tensor: bool):
+    """Recover the represented scale; never estimate it from sparsity.
+
+    A baked tensor contains only ``{-s, 0, +s}``. Its absmean is ``s`` times
+    the nonzero fraction, so applying absmean a second time shrinks every
+    non-dense row. This validator makes that corruption impossible.
+    """
+    if per_tensor:
+        scale = np.float32(np.abs(Wb).max())
+        valid = np.all((Wb == 0) | (np.abs(Wb) == scale))
+        if not valid:
+            raise ValueError("source='baked' requires one exact tensor ternary scale")
+        return np.full(Wb.shape[:-1], scale, np.float32)
+    scale = np.abs(Wb).max(axis=2).astype(np.float32)
+    valid = np.all((Wb == 0) | (np.abs(Wb) == scale[..., None]))
+    if not valid:
+        raise ValueError("source='baked' requires exact ternary values in every block")
+    return scale
+
+
+def pack_bitnet_np(W, per_tensor=True, source: str = "latent"):
+    if source not in {"latent", "baked"}:
+        raise ValueError("source must be 'latent' or 'baked'")
     W = np.ascontiguousarray(W, np.float32)
     N, K = W.shape
+    if K % 32:
+        raise ValueError("packed ternary width must be divisible by 32")
+    if not np.isfinite(W).all():
+        raise ValueError("weight contains NaN or infinity")
     nb = K // 32
     Wb = W.reshape(N, nb, 32)
-    scale = (np.full((N, nb), max(np.abs(W).mean(), 1e-5), np.float32) if per_tensor
-             else np.maximum(np.abs(Wb).mean(axis=2), 1e-5).astype(np.float32))
-    q = np.clip(np.rint(Wb / scale[..., None]), -1, 1).astype(np.int32)
+    if source == "baked":
+        scale = _baked_scales(Wb, per_tensor)
+    else:
+        scale = (np.full((N, nb), max(np.abs(W).mean(), 1e-5), np.float32)
+                 if per_tensor else
+                 np.maximum(np.abs(Wb).mean(axis=2), 1e-5).astype(np.float32))
+    divisor = np.where(scale > 0, scale, 1.0)
+    q = np.clip(np.rint(Wb / divisor[..., None]), -1, 1).astype(np.int32)
     code = (q + 1).astype(np.uint32).reshape(N, nb, 8, 4)
     out = np.zeros((N, nb, 10), np.uint8)
     out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
@@ -50,16 +82,22 @@ class PackedExpert:
 class CPUEngine:
     """Batch-1 Qwen3-MoE decode over ternary experts. fmt: 'bitnet' | 'tl1'."""
 
-    def __init__(self, hf_dir, fmt: str = "bitnet", pt: bool = True):
+    def __init__(self, hf_dir, fmt: str = "bitnet", pt: bool = True,
+                 weight_source: str = "auto"):
         from transformers import AutoConfig, AutoModelForCausalLM
         bn._lib.bn_init()
         self.cfg = AutoConfig.from_pretrained(hf_dir)
         model = AutoModelForCausalLM.from_pretrained(hf_dir, torch_dtype="float32")
-        self.fmt, self.pt = fmt, pt
+        if weight_source == "auto":
+            weight_source = "baked" if (Path(hf_dir) / "bake_report.json").is_file() \
+                else "latent"
+        if weight_source not in {"latent", "baked"}:
+            raise ValueError("weight_source must be auto, latent, or baked")
+        self.fmt, self.pt, self.weight_source = fmt, pt, weight_source
         self._load(model)
 
     def _pack(self, W):
-        a = pack_bitnet_np(W, per_tensor=self.pt)
+        a = pack_bitnet_np(W, per_tensor=self.pt, source=self.weight_source)
         return bn.pack_tl1(a) if self.fmt == "tl1" else a
 
     def _load(self, model):

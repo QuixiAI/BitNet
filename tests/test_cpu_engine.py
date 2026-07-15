@@ -14,6 +14,23 @@ pytest.importorskip("transformers")
 import torch  # noqa: E402
 
 
+def test_baked_pack_preserves_scale_instead_of_reapplying_absmean():
+    from bitnet_train.cpu import bitnet_cpu as bn
+    from bitnet_train.cpu.engine import pack_bitnet_np
+    codes = np.zeros((3, 64), np.float32)
+    codes[:, ::5] = 1
+    codes[:, 2::7] = -1
+    baked = codes * np.float32(0.03125)
+    packed = pack_bitnet_np(baked, per_tensor=True, source="baked")
+    np.testing.assert_array_equal(bn.unpack_ternary_f32(packed), baked)
+
+
+def test_baked_pack_rejects_dense_latents():
+    from bitnet_train.cpu.engine import pack_bitnet_np
+    with pytest.raises(ValueError, match="exact tensor ternary scale"):
+        pack_bitnet_np(np.linspace(-1, 1, 64, dtype=np.float32)[None], source="baked")
+
+
 def _tiny_moe(tmp_path):
     from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
     torch.manual_seed(0)

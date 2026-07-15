@@ -351,12 +351,14 @@ class TeacherWrapper(nn.Module):
         return self.model(input_ids).logits
 
     @torch.no_grad()
-    def slice_server(self, input_ids: torch.Tensor, drop_last: bool = True):
+    def slice_server(self, input_ids: torch.Tensor, drop_last: bool = True,
+                     hidden_layers: tuple[int, ...] = ()):
         """One decoder pass -> (B, T, H) hidden; teacher LOGITS are then computed
         per row slice on demand — full teacher (T, V) never materializes (§5.1).
         drop_last aligns with next-token targets (positions 0..T-2)."""
         base = self.model.model                     # the decoder (post final norm)
-        hidden = base(input_ids).last_hidden_state
+        output = base(input_ids, output_hidden_states=bool(hidden_layers))
+        hidden = output.last_hidden_state
         if drop_last:
             hidden = hidden[:, :-1, :]
         flat = hidden.reshape(-1, hidden.shape[-1])
@@ -364,7 +366,15 @@ class TeacherWrapper(nn.Module):
 
         def serve(sl: slice) -> torch.Tensor:
             return (flat[sl] @ head_w.t()).float()
-        return serve
+        if not hidden_layers:
+            return serve
+        selected = {}
+        assert output.hidden_states is not None
+        for layer in hidden_layers:
+            if 0 <= layer < len(output.hidden_states):
+                value = output.hidden_states[layer]
+                selected[layer] = value[:, :-1] if drop_last else value
+        return serve, selected
 
 
 @dataclass
@@ -390,47 +400,54 @@ class LossComputer:
         return self.cfg.prefer_fused and device.type == "mps"
 
     def __call__(self, hidden: torch.Tensor, head_w: torch.Tensor,
-                 targets: torch.Tensor, teacher_batch=None) -> dict:
+                 targets: torch.Tensor, teacher_batch=None,
+                 loss_mask: torch.Tensor | None = None) -> dict:
         cfg = self.cfg
         T = hidden.shape[0]
         fused = self._fused(hidden.device)
         ce_sum = hidden.new_zeros((), dtype=torch.float32)
         kd_sum = hidden.new_zeros((), dtype=torch.float32)
-        n_ce = max(int((targets != IGNORE).sum()), 1)
+        if loss_mask is None:
+            loss_mask = targets != IGNORE
+        else:
+            loss_mask = loss_mask.to(device=targets.device, dtype=torch.bool)
+            if tuple(loss_mask.shape) != tuple(targets.shape):
+                raise ValueError("loss mask shape must equal targets")
+        n_ce = max(int(loss_mask.sum()), 1)
         for r0 in range(0, T, cfg.tchunk):
             h = hidden[r0:r0 + cfg.tchunk]
             tg = targets[r0:r0 + cfg.tchunk]
+            mask = loss_mask[r0:r0 + cfg.tchunk].float()
             if fused and cfg.kd_mode == "dense" and teacher_batch is not None:
                 logits = F.linear(h, head_w)
                 t_logits = teacher_batch(slice(r0, r0 + cfg.tchunk))
                 ce_v, kd_v = _FusedCEKD.apply(logits, t_logits.to(logits.dtype),
                                               tg.int(), 1.0 / cfg.tau)
-                ce_sum = ce_sum + ce_v.float().sum()
-                kd_sum = kd_sum + kd_v.float().sum()
+                ce_sum = ce_sum + (ce_v.float() * mask).sum()
+                kd_sum = kd_sum + (kd_v.float() * mask).sum()
                 continue
             if fused:
                 logits = F.linear(h, head_w)
-                ce_sum = ce_sum + _FusedCE.apply(logits, tg.int()).float().sum()
+                ce_sum = ce_sum + (_FusedCE.apply(logits, tg.int()).float() * mask).sum()
             else:
-                ce_sum = ce_sum + chunked_ce(h, head_w, tg, cfg.vchunk).sum()
+                ce_sum = ce_sum + (chunked_ce(h, head_w, tg, cfg.vchunk) * mask).sum()
             if cfg.kd_mode == "dense" and teacher_batch is not None:
                 t_logits = teacher_batch(slice(r0, r0 + cfg.tchunk))
-                kd_sum = kd_sum + chunked_kd_dense(h, head_w, t_logits,
-                                                   cfg.tau, cfg.vchunk).sum()
+                kd_sum = kd_sum + (chunked_kd_dense(h, head_w, t_logits,
+                                                    cfg.tau, cfg.vchunk) * mask).sum()
             elif cfg.kd_mode == "topk" and teacher_batch is not None:
                 t_idx, t_prob = teacher_batch
                 ti = t_idx[r0:r0 + cfg.tchunk]
                 tp = t_prob[r0:r0 + cfg.tchunk]
                 if fused:
-                    kd_sum = kd_sum + _FusedKDTopk.apply(
+                    kd_sum = kd_sum + (_FusedKDTopk.apply(
                         logits, ti.int(), tp.float(), 1.0 / cfg.tau,
-                        cfg.tail_mode).float().sum()
+                        cfg.tail_mode).float() * mask).sum()
                 else:
-                    kd_sum = kd_sum + chunked_kd_topk(h, head_w, ti, tp, cfg.tau,
-                                                      cfg.tail_mode,
-                                                      cfg.vchunk).sum()
+                    kd_sum = kd_sum + (chunked_kd_topk(
+                        h, head_w, ti, tp, cfg.tau, cfg.tail_mode, cfg.vchunk) * mask).sum()
         ce = ce_sum / n_ce
-        kd = kd_sum / T
+        kd = kd_sum / n_ce
         total = ce + cfg.alpha * cfg.tau ** 2 * kd
         return {"loss": total, "ce": ce.detach(), "kd": kd.detach()}
 
@@ -461,7 +478,11 @@ def build_topk_cache(teacher, data_dir: str | Path, out_dir: str | Path, *,
     model.eval()
     with torch.no_grad():
         for b0 in range(0, n, batch_size):
-            ids = torch.stack([ds[i] for i in range(b0, min(b0 + batch_size, n))])
+            samples = [ds[i] for i in range(b0, min(b0 + batch_size, n))]
+            ids = torch.stack([
+                sample[0] if isinstance(sample, (tuple, list)) else sample
+                for sample in samples
+            ])
             logits = model(ids.to(device)).logits.float() / tau
             probs = F.softmax(logits, dim=-1)
             top = probs.topk(k, dim=-1)

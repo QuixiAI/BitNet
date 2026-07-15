@@ -54,6 +54,13 @@ static inline float bn_half_to_float(const uint8_t *p) {
 #endif
 }
 
+static inline float bn_bfloat16_to_float(uint16_t value) {
+    const uint32_t bits = (uint32_t) value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
 static float bn_e4m3_lut[256];
 static int8_t bn_b3_lut[256][5];           // base-3 byte -> 5 ternary values {-1,0,+1}
 static int bn_e4m3_ready = 0;
@@ -82,13 +89,31 @@ void bn_init(void) {                       // build the decode LUTs (idempotent)
 // activation quant: per-token absmax int8, clamp +/-127, round-half-even
 // ---------------------------------------------------------------------------
 
+static inline float bn_round_half_even(float value) {
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_roundevenf)
+    // Unlike rintf, this is independent of the process floating-point rounding
+    // mode.  Clang lowers it to vectorizable ties-to-even instructions.
+    return __builtin_roundevenf(value);
+#endif
+#endif
+    // Portable fallback. TQ1 activation quotients are clamped to int8 below,
+    // so the parity test is exact throughout the finite supported range.
+    float lower = floorf(value);
+    const float fraction = value - lower;
+    if (fraction > 0.5f ||
+        (fraction == 0.5f && fmodf(fabsf(lower), 2.0f) == 1.0f)) {
+        lower += 1.0f;
+    }
+    return lower;
+}
+
 float bn_act_quant_int8(const float *x, int64_t K, int8_t *xq) {
     float amax = 0.0f;
     for (int64_t i = 0; i < K; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     const float s = amax / 127.0f;
-    const float inv = s > 0.0f ? 1.0f / s : 0.0f;
     for (int64_t i = 0; i < K; i++) {
-        float r = rintf(x[i] * inv);
+        float r = s > 0.0f ? bn_round_half_even(x[i] / s) : 0.0f;
         if (r > 127.0f) r = 127.0f; else if (r < -127.0f) r = -127.0f;
         xq[i] = (int8_t)r;
     }
@@ -175,6 +200,305 @@ void bn_gemv_w2a8(const uint8_t *wq, int64_t N, int64_t K, const int8_t *xq,
     bn_gemv_w2a8_neon(wq, N, K, xq, a_scale, pt, out);
 #else
     bn_gemv_w2a8_scalar(wq, N, K, xq, a_scale, pt, out);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// TQ1_V schema-2 GEMV (Llama decode): canonical payload + expanded codebook
+//
+// The canonical artifact stores 32 8-weight indices in each 256-weight block.
+// A backend-private expanded codebook (one int8[8] per physical index) is built
+// once by the loader and retained alongside the canonical bytes.  The scalar
+// implementation is permanent; the NEON variant changes only dot8, so every
+// profile shares the same validation, scale, and affine epilogue.
+// ---------------------------------------------------------------------------
+
+enum {
+    BN_TQ1_V11_R = 0,
+    BN_TQ1_V12_R = 1,
+    BN_TQ1_V11_B = 2,
+    BN_TQ1_V12_B = 3,
+    BN_TQ1_V11_A4_R = 4,
+};
+
+static inline uint32_t bn_tq1_index(const uint8_t *block, int index_offset,
+                                    int high_bits, int group) {
+    const uint8_t *low = block + index_offset;
+    const uint8_t *high = low + 32;
+    const int bit = group * high_bits;
+    const int byte = bit >> 3;
+    const int shift = bit & 7;
+    uint32_t word = high[byte];
+    const int high_bytes = high_bits * 4;
+    if (byte + 1 < high_bytes) word |= (uint32_t) high[byte + 1] << 8;
+    return (uint32_t) low[group] |
+           (((word >> shift) & ((1u << high_bits) - 1u)) << 8);
+}
+
+static inline int32_t bn_tq1_dot8_scalar(const int8_t *x, const int8_t *code) {
+    int32_t sum = 0;
+    for (int lane = 0; lane < 8; lane++) sum += (int32_t) x[lane] * code[lane];
+    return sum;
+}
+
+#if defined(__ARM_NEON)
+static inline int32_t bn_tq1_dot8_neon(const int8_t *x, const int8_t *code) {
+    const int8x8_t xv = vld1_s8(x);
+    const int8x8_t cv = vld1_s8(code);
+    return (int32_t) vaddlvq_s16(vmull_s8(xv, cv));
+}
+#if defined(__ARM_FEATURE_DOTPROD)
+static inline int32_t bn_tq1_dot32_dotprod(const int8_t *x,
+                                           const int8_t *c0, const int8_t *c1,
+                                           const int8_t *c2, const int8_t *c3) {
+    const int8x16_t code01 = vcombine_s8(vld1_s8(c0), vld1_s8(c1));
+    const int8x16_t code23 = vcombine_s8(vld1_s8(c2), vld1_s8(c3));
+    int32x4_t sum = vdotq_s32(vdupq_n_s32(0), code01, vld1q_s8(x));
+    sum = vdotq_s32(sum, code23, vld1q_s8(x + 16));
+    return vaddvq_s32(sum);
+}
+#endif
+#endif
+
+// Return 0 on success.  Invalid profile, dimensions, scale, reserved index, or
+// affine metadata returns a negative code and never silently decodes garbage.
+static int bn_tq1_gemv_impl(const uint8_t *wq, const uint16_t *row_scale,
+                            const int8_t *codebook, const uint8_t *legal,
+                            int64_t index_count, int64_t N, int64_t K, int profile,
+                            int row_scale_bf16,
+                            const int8_t *xq, const float *act_scale,
+                            int activation_block256, float *out, int use_neon) {
+    int high_bits, raw_bytes, block_bytes, row_mode, affine;
+    switch (profile) {
+        case BN_TQ1_V11_R:    high_bits = 3; raw_bytes = 44; block_bytes = 44; row_mode = 1; affine = 0; break;
+        case BN_TQ1_V12_R:    high_bits = 4; raw_bytes = 48; block_bytes = 48; row_mode = 1; affine = 0; break;
+        case BN_TQ1_V11_B:    high_bits = 3; raw_bytes = 44; block_bytes = 46; row_mode = 0; affine = 0; break;
+        case BN_TQ1_V12_B:    high_bits = 4; raw_bytes = 48; block_bytes = 50; row_mode = 0; affine = 0; break;
+        case BN_TQ1_V11_A4_R: high_bits = 3; raw_bytes = 44; block_bytes = 48; row_mode = 1; affine = 1; break;
+        default: return -1;
+    }
+    if (!wq || !row_scale || !codebook || !legal || !xq || !act_scale || !out ||
+        N <= 0 || K <= 0 || K % 256 != 0 ||
+        index_count != (int64_t) (1u << (high_bits + 8))) return -2;
+    const int64_t blocks_per_row = K / 256;
+    for (int64_t n = 0; n < N; n++) {
+        float ws_row = 1.0f;
+        if (row_mode) {
+            ws_row = row_scale_bf16 ? bn_bfloat16_to_float(row_scale[n]) :
+                                      bn_half_to_float((const uint8_t *) (row_scale + n));
+            if (!isfinite(ws_row) || ws_row < 0.0f) return -3;
+        }
+        int64_t token_acc = 0;
+        int64_t token_numerator = 0;
+        float scaled_acc = 0.0f;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            const uint8_t *block = wq + (n * blocks_per_row + b) * block_bytes;
+            const int index_offset = row_mode ? 0 : 2;
+            const float as = act_scale[activation_block256 ? b : 0];
+            if (!isfinite(as) || as < 0.0f) return -3;
+            int64_t block_acc = 0;
+            int64_t block_numerator = 0;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+            if (use_neon) {
+                for (int subblock = 0; subblock < 8; subblock++) {
+                    const int group = subblock * 4;
+                    uint32_t index[4];
+                    const int8_t *code[4];
+                    for (int extra = 0; extra < 4; extra++) {
+                        index[extra] = bn_tq1_index(
+                            block, index_offset, high_bits, group + extra);
+                        if (index[extra] >= (uint32_t) index_count ||
+                            !legal[index[extra]]) return -4;
+                        code[extra] = codebook + (int64_t) index[extra] * 8;
+                    }
+                    const int8_t *xa = xq + b * 256 + group * 8;
+                    const int64_t dot = bn_tq1_dot32_dotprod(
+                        xa, code[0], code[1], code[2], code[3]);
+                    if (!affine) {
+                        block_acc += dot;
+                    } else {
+                        const uint8_t byte = block[raw_bytes + (subblock >> 1)];
+                        const uint8_t nibble = (subblock & 1) ? (byte >> 4) : (byte & 15);
+                        const int rho_num = 6 + (nibble & 3);
+                        const int mu_id = (nibble >> 2) & 3;
+                        if (nibble > 11 || mu_id == 3) return -5;
+                        const int64_t xsum =
+                            (int64_t) vaddlvq_s8(vld1q_s8(xa)) +
+                            (int64_t) vaddlvq_s8(vld1q_s8(xa + 16));
+                        const int mu_num = mu_id == 0 ? 0 : (mu_id == 1 ? 1 : -1);
+                        block_numerator += (int64_t) rho_num *
+                                           (8 * dot + mu_num * xsum);
+                    }
+                }
+            } else
+#endif
+            {
+            for (int group = 0; group < 32; group++) {
+                const uint32_t index = bn_tq1_index(block, index_offset, high_bits, group);
+                if (index >= (uint32_t) index_count || !legal[index]) return -4;
+                const int8_t *code = codebook + (int64_t) index * 8;
+                const int8_t *xa = xq + b * 256 + group * 8;
+                int32_t dot;
+#if defined(__ARM_NEON)
+                dot = use_neon ? bn_tq1_dot8_neon(xa, code) : bn_tq1_dot8_scalar(xa, code);
+#else
+                (void) use_neon;
+                dot = bn_tq1_dot8_scalar(xa, code);
+#endif
+                if (!affine) {
+                    block_acc += dot;
+                } else if ((group & 3) == 0) {
+                    // A4's metadata controls one 32-weight / four-codeword unit.
+                    const int subblock = group >> 2;
+                    const uint8_t byte = block[raw_bytes + (subblock >> 1)];
+                    const uint8_t nibble = (subblock & 1) ? (byte >> 4) : (byte & 15);
+                    const int rho_num = 6 + (nibble & 3);
+                    const int mu_id = (nibble >> 2) & 3;
+                    if (nibble > 11 || mu_id == 3) return -5;
+                    int64_t sub_dot = dot;
+                    int64_t xsum = 0;
+                    for (int lane = 0; lane < 32; lane++) xsum += xa[lane];
+                    for (int extra = 1; extra < 4; extra++) {
+                        const int g2 = group + extra;
+                        const uint32_t i2 = bn_tq1_index(block, index_offset, high_bits, g2);
+                        if (i2 >= (uint32_t) index_count || !legal[i2]) return -4;
+                        const int8_t *c2 = codebook + (int64_t) i2 * 8;
+                        const int8_t *x2 = xq + b * 256 + g2 * 8;
+#if defined(__ARM_NEON)
+                        sub_dot += use_neon ? bn_tq1_dot8_neon(x2, c2) : bn_tq1_dot8_scalar(x2, c2);
+#else
+                        sub_dot += bn_tq1_dot8_scalar(x2, c2);
+#endif
+                    }
+                    const int mu_num = mu_id == 0 ? 0 : (mu_id == 1 ? 1 : -1);
+                    block_numerator += (int64_t) rho_num * (8 * sub_dot + mu_num * xsum);
+                    group += 3;
+                }
+            }
+            }
+            if (affine) {
+                if (activation_block256) scaled_acc += ((float) block_numerator / 64.0f) * as;
+                else token_numerator += block_numerator;
+            } else if (row_mode) {
+                if (activation_block256) scaled_acc += (float) block_acc * as;
+                else token_acc += block_acc;
+            } else {
+                const float ws = bn_half_to_float(block);
+                if (!isfinite(ws) || ws < 0.0f) return -3;
+                scaled_acc += (float) block_acc * ws * (activation_block256 ? as : 1.0f);
+            }
+        }
+        if (affine) {
+            out[n] = ws_row * (activation_block256 ? scaled_acc :
+                               ((float) token_numerator / 64.0f) * act_scale[0]);
+        } else if (row_mode) {
+            out[n] = ws_row * (activation_block256 ? scaled_acc :
+                               (float) token_acc * act_scale[0]);
+        } else {
+            out[n] = activation_block256 ? scaled_acc : scaled_acc * act_scale[0];
+        }
+        if (!isfinite(out[n])) return -6;
+    }
+    return 0;
+}
+
+int bn_tq1_gemv_scalar(const uint8_t *wq, const uint16_t *row_scale,
+                       const int8_t *codebook, const uint8_t *legal,
+                       int64_t index_count, int64_t N, int64_t K, int profile,
+                       int row_scale_bf16,
+                       const int8_t *xq, const float *act_scale,
+                       int activation_block256, float *out) {
+    return bn_tq1_gemv_impl(wq, row_scale, codebook, legal, index_count, N, K,
+                            profile, row_scale_bf16, xq, act_scale,
+                            activation_block256, out, 0);
+}
+
+#if defined(__ARM_NEON)
+int bn_tq1_gemv_neon(const uint8_t *wq, const uint16_t *row_scale,
+                     const int8_t *codebook, const uint8_t *legal,
+                     int64_t index_count, int64_t N, int64_t K, int profile,
+                     int row_scale_bf16,
+                     const int8_t *xq, const float *act_scale,
+                     int activation_block256, float *out) {
+    return bn_tq1_gemv_impl(wq, row_scale, codebook, legal, index_count, N, K,
+                            profile, row_scale_bf16, xq, act_scale,
+                            activation_block256, out, 1);
+}
+#endif
+
+int bn_tq1_gemv(const uint8_t *wq, const uint16_t *row_scale,
+                const int8_t *codebook, const uint8_t *legal,
+                int64_t index_count, int64_t N, int64_t K, int profile,
+                int row_scale_bf16,
+                const int8_t *xq, const float *act_scale,
+                int activation_block256, float *out) {
+#if defined(__ARM_NEON)
+    return bn_tq1_gemv_neon(wq, row_scale, codebook, legal, index_count, N, K,
+                            profile, row_scale_bf16, xq, act_scale,
+                            activation_block256, out);
+#else
+    return bn_tq1_gemv_scalar(wq, row_scale, codebook, legal, index_count, N, K,
+                              profile, row_scale_bf16, xq, act_scale,
+                              activation_block256, out);
+#endif
+}
+
+static int bn_tq1_gemm_impl(const uint8_t *wq, const uint16_t *row_scale,
+                            const int8_t *codebook, const uint8_t *legal,
+                            int64_t index_count, int64_t M, int64_t N, int64_t K,
+                            int profile, int row_scale_bf16,
+                            const int8_t *xq, const float *act_scale,
+                            int activation_block256, float *out, int use_neon) {
+    if (M <= 0 || !xq || !act_scale || !out) return -2;
+    const int64_t scales_per_token = activation_block256 ? K / 256 : 1;
+    for (int64_t m = 0; m < M; m++) {
+        const int status = bn_tq1_gemv_impl(
+            wq, row_scale, codebook, legal, index_count, N, K, profile,
+            row_scale_bf16, xq + m * K, act_scale + m * scales_per_token,
+            activation_block256, out + m * N, use_neon);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+int bn_tq1_gemm_scalar(const uint8_t *wq, const uint16_t *row_scale,
+                       const int8_t *codebook, const uint8_t *legal,
+                       int64_t index_count, int64_t M, int64_t N, int64_t K,
+                       int profile, int row_scale_bf16,
+                       const int8_t *xq, const float *act_scale,
+                       int activation_block256, float *out) {
+    return bn_tq1_gemm_impl(wq, row_scale, codebook, legal, index_count, M, N, K,
+                            profile, row_scale_bf16, xq, act_scale,
+                            activation_block256, out, 0);
+}
+
+#if defined(__ARM_NEON)
+int bn_tq1_gemm_neon(const uint8_t *wq, const uint16_t *row_scale,
+                     const int8_t *codebook, const uint8_t *legal,
+                     int64_t index_count, int64_t M, int64_t N, int64_t K,
+                     int profile, int row_scale_bf16,
+                     const int8_t *xq, const float *act_scale,
+                     int activation_block256, float *out) {
+    return bn_tq1_gemm_impl(wq, row_scale, codebook, legal, index_count, M, N, K,
+                            profile, row_scale_bf16, xq, act_scale,
+                            activation_block256, out, 1);
+}
+#endif
+
+int bn_tq1_gemm(const uint8_t *wq, const uint16_t *row_scale,
+                const int8_t *codebook, const uint8_t *legal,
+                int64_t index_count, int64_t M, int64_t N, int64_t K,
+                int profile, int row_scale_bf16,
+                const int8_t *xq, const float *act_scale,
+                int activation_block256, float *out) {
+#if defined(__ARM_NEON)
+    return bn_tq1_gemm_neon(wq, row_scale, codebook, legal, index_count, M, N, K,
+                            profile, row_scale_bf16, xq, act_scale,
+                            activation_block256, out);
+#else
+    return bn_tq1_gemm_scalar(wq, row_scale, codebook, legal, index_count, M, N, K,
+                              profile, row_scale_bf16, xq, act_scale,
+                              activation_block256, out);
 #endif
 }
 

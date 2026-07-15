@@ -11,6 +11,8 @@ Routes (train_plan §8.1):
   I2_S   — utils/convert-hf-to-gguf-bitnet.py + fork llama-quantize (3rdparty submodule)
   TQ2_0  — mainline convert_hf_to_gguf.py + llama-quantize TQ2_0
            (mainline dir: $LLAMA_MAINLINE, default ~/llama.cpp)
+  TQ1_V  — schema-2 canonical artifact -> ordinary F16 conversion -> exact
+           packed-tensor rewrite (no dense rediscovery or generic quantizer)
 """
 
 from __future__ import annotations
@@ -185,6 +187,43 @@ def export_i2s(baked_dir: str | Path, out_gguf: str | Path,
                             log_tail=log[-2000:])
     return ExportResult("i2s_bitnet_cpp", ok=True, gguf=str(out_gguf),
                         log_tail=log[-800:])
+
+
+def export_tq1(artifact_dir: str | Path, out_gguf: str | Path,
+               converter: str | Path | None = None,
+               python: str = "python3", overwrite: bool = False) -> ExportResult:
+    """Exact schema-2 TQ1 route.
+
+    Unlike the legacy routes, this consumes only a validated canonical packed
+    artifact.  The ordinary converter is used solely for tokenizer metadata and
+    non-TQ1 tensors; all TQ1 bytes come directly from the artifact.
+    """
+    artifact = Path(artifact_dir)
+    if not (artifact / "tq1_manifest.json").is_file():
+        return ExportResult(
+            "tq1_v", ok=False,
+            reason=f"canonical tq1_manifest.json not found under {artifact}")
+    if converter is not None and not Path(converter).is_file():
+        return ExportResult(
+            "tq1_v", ok=False, skipped=True,
+            reason=f"ordinary GGUF converter not found at {converter}")
+    try:
+        from bitnet_train.tq1.gguf import export_tq1_gguf
+        report = export_tq1_gguf(
+            artifact, out_gguf, converter=converter, python=python,
+            overwrite=overwrite,
+            command=("bitnet_train.export.export_gguf.export_tq1",))
+    except FileNotFoundError as exc:
+        return ExportResult("tq1_v", ok=False, skipped=True, reason=str(exc))
+    except Exception as exc:
+        return ExportResult("tq1_v", ok=False, reason=str(exc))
+    return ExportResult(
+        "tq1_v", ok=True, gguf=str(out_gguf),
+        log_tail=json.dumps({
+            "gguf_sha256": report["gguf_sha256"],
+            "quant_spec_sha256": report["quant_spec_sha256"],
+            "target_tensors": report["target_tensors"],
+        }, sort_keys=True))
 
 
 def runtime_ppl(gguf: str | Path, text_file: str | Path,

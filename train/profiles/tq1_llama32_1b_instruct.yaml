@@ -1,0 +1,45 @@
+# TQ1_V healing profile for the canonical quant/quant_spec.md primary target.
+name: tq1_llama32_1b_instruct
+base_model: unsloth/Llama-3.2-1B-Instruct
+teacher: unsloth/Llama-3.2-1B-Instruct
+
+target_linear_regexes:
+  - model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)
+  - model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)
+keep_fp_regexes:
+  - lm_head
+
+freeze_fp_params: false
+quant:
+  scheme: tq1_v
+  # Override this path with train.py --tq1-artifact for each immutable run.
+  artifact: runs/llama32-1b-instruct-tq1-v12-ptq
+  default_profile: tq1_v12-j-r
+  default_codebook_id: llama32_v12j
+  activation_mode: a8_token
+  importance_stats: runs/llama32-1b-instruct.calibration.safetensors
+  qat_projection: soft
+  candidate_count: 32
+  top_m: 8
+  assignment_chunk: 2048
+  temperature_start: 1.0
+  temperature_end: 0.05
+  soft_steps: 1000
+  hard_steps: 4000
+  freeze_indices_at: 5000
+  freeze_max_step: 9000
+  freeze_flip_threshold: 0.0001
+  freeze_margin_threshold: 0.0
+  freeze_sustain_evals: 3
+  freeze_trend_tolerance: 0.01
+  margin: 0.1
+  lambda_margin: 0.01
+  hidden_layers: [4, 8, 12, 16]
+  lambda_hidden: 0.05
+  tensor_overrides: []
+
+export_route: [tq1_v]
+eval_modes: [w_a8, w_only]
+data:
+  tokenizer: unsloth/Llama-3.2-1B-Instruct
+  shard_set: llama32_instruct

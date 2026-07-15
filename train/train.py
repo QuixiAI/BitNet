@@ -39,7 +39,8 @@ from bitnet_train.bitlinear import (  # noqa: E402
     code_flip_rates, iter_bitexperts, set_eval_mode, snapshot_codes, ternary_health)
 from bitnet_train.conversion import build_param_groups, load_converted, load_profile  # noqa: E402
 from bitnet_train.data import (  # noqa: E402
-    IndexedWindows, PackedWindows, calibration_windows, cycle, load_manifest, make_loader)
+    IndexedWindows, PackedWindows, ResumableDataStream, calibration_windows,
+    load_manifest, make_loader)
 from bitnet_train.distill import LossComputer, LossConfig, TeacherWrapper, TopkCacheReader  # noqa: E402
 from eval_ppl import evaluate_ppl, kl_tf  # noqa: E402
 
@@ -236,16 +237,30 @@ class HealthMonitor:
 
 # --------------------------------------------------------------------------- checkpointing
 def save_checkpoint(accelerator, model, optimizer, run_dir, step, tokens_seen, meta,
-                    seeds):
+                    seeds, training_state=None):
     path = os.path.join(run_dir, f"step-{step:06d}")
     if accelerator.is_main_process:
         os.makedirs(path, exist_ok=True)
-        accelerator.unwrap_model(model).save_pretrained(path)
     accelerator.wait_for_everyone()
-    state = {"optimizer": optimizer.state_dict(), "step": step,
+    # get_state_dict is collective for FSDP. Every rank must participate before
+    # rank zero writes the ordinary HF checkpoint consumed by exporters.
+    full_state = accelerator.get_state_dict(model)
+    if accelerator.is_main_process:
+        accelerator.unwrap_model(model).save_pretrained(
+            path, state_dict=full_state, save_function=accelerator.save)
+    accelerator.wait_for_everyone()
+    # Accelerate owns the distributed model/optimizer/RNG serialization. A
+    # rank-zero optimizer.state_dict() is incomplete when parameters are sharded.
+    distributed_path = os.path.join(path, "distributed_state")
+    accelerator.save_state(distributed_path, safe_serialization=False)
+    state = {"step": step,
              "tokens_seen": tokens_seen,
+             "training_state": dict(training_state or {}),
              "meta": {**meta, "seeds": seeds,
-                      "rng_states": provenance.rng_capture()}}
+                      "rng_states": provenance.rng_capture(),
+                      "distributed_state": "distributed_state"}}
+    if accelerator.num_processes == 1:
+        state["optimizer"] = optimizer.state_dict()
     name = "trainer_state.pt" if accelerator.is_main_process \
         else f"trainer_state_rank{accelerator.process_index}.pt"
     torch.save(state, os.path.join(path, name))
@@ -287,6 +302,8 @@ def build_argparser(here: Path) -> argparse.ArgumentParser:
     ap.add_argument("--out-dir", default=str(here / "checkpoints"))
     ap.add_argument("--backend", default=None, choices=[None, "reference", "metal"],
                     help="BitLinear backend (default: metal on MPS, else reference)")
+    ap.add_argument("--tq1-artifact", default=None,
+                    help="schema-2 PTQ artifact; required when profile quant.scheme=tq1_v")
     # recipe (train_plan §5.6 starter values live in configs/a1/t1.yaml)
     ap.add_argument("--total-tokens", type=float, default=None)
     ap.add_argument("--epochs", type=float, default=1.0)
@@ -393,8 +410,9 @@ def main(argv=None):
         raise SystemExit("--init is required (run train/init_from_base.py first)")
     ckpt = args.resume or args.init
     latent_dtype = torch.bfloat16 if args.latent_dtype == "bf16" else torch.float32
-    model, conv_report = load_converted(ckpt, profile, backend=backend,
-                                        dtype=latent_dtype)      # §5.4: fp32 baseline / bf16 hatch
+    model, conv_report = load_converted(
+        ckpt, profile, backend=backend, dtype=latent_dtype,
+        tq1_artifact=args.tq1_artifact)      # §5.4: fp32 baseline / bf16 hatch
     if args.grad_checkpointing:
         try:
             model.gradient_checkpointing_enable()
@@ -417,6 +435,7 @@ def main(argv=None):
     calib = calibration_windows(args.data_dir, args.calib_windows,
                                 split="val" if "val" in train_ds.manifest["splits"]
                                 else "train", seq_len=args.seq_len)
+    calib_ids = calib[0] if isinstance(calib, (tuple, list)) else calib
 
     tokens_per_step = (args.batch_size * args.grad_accum * args.seq_len
                        * accelerator.num_processes)
@@ -443,6 +462,30 @@ def main(argv=None):
     base_lrs = [g["lr"] for g in optimizer.param_groups]
     raw_model = accelerator.unwrap_model(model)
 
+    # ---- exact TQ1 curriculum (soft -> hard -> gate-qualified frozen)
+    tq1_controller = None
+    if profile.quant_scheme == "tq1_v":
+        from bitnet_train.tq1.curriculum import QATController, QATSchedule
+        from bitnet_train.tq1.qat import iter_tq1linears
+        q = profile.quant
+        tq1_controller = QATController(
+            [module for _, module in iter_tq1linears(raw_model)],
+            QATSchedule(
+                initial_phase=str(q["qat_projection"]),
+                temperature_start=float(q.get("temperature_start", 1.0)),
+                temperature_end=float(q.get("temperature_end", 0.05)),
+                soft_steps=int(q.get("soft_steps", 1000)),
+                hard_steps=int(q.get("hard_steps", 4000)),
+                freeze_indices_at=(None if q.get("freeze_indices_at") is None
+                                   else int(q["freeze_indices_at"])),
+                freeze_max_step=(None if q.get("freeze_max_step") is None
+                                 else int(q["freeze_max_step"])),
+                flip_threshold=float(q.get("freeze_flip_threshold", 1e-4)),
+                margin_threshold=float(q.get("freeze_margin_threshold", 0.0)),
+                sustain_evals=int(q.get("freeze_sustain_evals", 3)),
+                trend_tolerance=float(q.get("freeze_trend_tolerance", 0.01)),
+            ))
+
     # ---- teacher / KD (§5.1: KD by default; live dense teacher for A-track)
     teacher = cache_reader = None
     loss_cfg = LossConfig(alpha=args.kd_alpha, tau=args.kd_tau, kd_mode=args.kd,
@@ -461,13 +504,26 @@ def main(argv=None):
         cache_reader = TopkCacheReader(args.topk_cache, args.data_dir, tau=args.kd_tau)
 
     # ---- provenance meta (§5.6, binding)
+    tq1_meta = None
+    if tq1_controller is not None:
+        first_tq1 = tq1_controller.modules[0]
+        tq1_meta = {
+            "quant_spec_json": first_tq1.quant_spec_json,
+            "quant_spec_sha256": first_tq1.quant_spec_sha256,
+            "source_artifact": str(args.tq1_artifact or profile.quant.get("artifact")),
+            "schedule": tq1_controller.state_dict()["schedule"],
+            "codebooks": sorted({module.codebook_id: module.codebook_sha256
+                                  for module in tq1_controller.modules}.items()),
+            "importance_stats": profile.quant.get("importance_stats"),
+        }
     meta = provenance.build_meta(
         profile_path=args.profile, model_config=raw_model.config,
         data_manifest=load_manifest(args.data_dir),
         extra={"backend": backend, "kd": args.kd, "init": str(args.init),
                "args": {k: v for k, v in vars(args).items() if k != "set"},
-               "teacher_cache": args.topk_cache})
+               "teacher_cache": args.topk_cache, "tq1": tq1_meta})
     start_step, tokens_seen = 0, 0
+    resume_training_state = {}
     if args.resume:
         st_path = os.path.join(args.resume,
                                f"trainer_state_rank{accelerator.process_index}.pt")
@@ -476,8 +532,22 @@ def main(argv=None):
         st = torch.load(st_path, map_location="cpu", weights_only=False)
         validate_resume_meta(st.get("meta", {}), meta, args.allow_hash_mismatch,
                              accelerator.print)
-        optimizer.load_state_dict(st["optimizer"])
+        distributed_state = os.path.join(args.resume, st.get("meta", {}).get(
+            "distributed_state", "distributed_state"))
+        if os.path.isdir(distributed_state):
+            accelerator.load_state(distributed_state)
+        elif "optimizer" in st:
+            # Backward-compatible single-process checkpoints only.
+            optimizer.load_state_dict(st["optimizer"])
+        else:
+            raise RuntimeError("checkpoint has neither distributed state nor optimizer state")
         start_step, tokens_seen = st["step"], st["tokens_seen"]
+        resume_training_state = st.get("training_state", {})
+        if tq1_controller is not None:
+            controller_state = resume_training_state.get("tq1_controller")
+            if controller_state is None:
+                raise RuntimeError("TQ1 checkpoint lacks resumable curriculum state")
+            tq1_controller.load_state_dict(controller_state)
         if "rng_states" in st.get("meta", {}):
             provenance.rng_restore(st["meta"]["rng_states"])
 
@@ -515,34 +585,89 @@ def main(argv=None):
     health = HealthMonitor(say, args.wandb, total_steps, args.warmup_steps) \
         if accelerator.is_main_process else None
 
-    train_iter = cycle(train_loader)
+    data_state = resume_training_state.get("data_stream")
+    if args.resume and tq1_controller is not None and data_state is None:
+        raise RuntimeError("TQ1 checkpoint lacks exact data-stream resume state")
+    train_iter = ResumableDataStream(
+        train_loader, seed=args.seed, state=data_state,
+        consumed_batches=start_step * args.grad_accum)
     head_w = raw_model.get_output_embeddings().weight
     train_mode = "a1" if is_moe else "w_a8"
     aux_coef = float(getattr(raw_model.config, "router_aux_loss_coef", 0.0) or 0.0)
     if is_moe and teacher is not None and accelerator.is_main_process:
         from bitnet_train.moe_metrics import capture_teacher_routing
         teacher_routing = capture_teacher_routing(
-            teacher.model, calib.to(accelerator.device), accelerator.device,
+            teacher.model, calib_ids.to(accelerator.device), accelerator.device,
+            # routing is defined over all tokens; assistant masks affect losses only.
             raw_model.config.num_experts_per_tok)     # Q-T0 §8.1 fixture
-    code_snapshot = snapshot_codes(raw_model) if accelerator.is_main_process else None
+    code_snapshot = snapshot_codes(raw_model)
     t0, tokens0 = time.time(), tokens_seen
     model.train()
 
     def one_micro_step(batch):
-        widx, ids = batch
+        widx, sample = batch
+        if isinstance(sample, (tuple, list)):
+            ids, token_loss_mask = sample
+            token_loss_mask = token_loss_mask.to(ids.device)
+        else:
+            ids, token_loss_mask = sample, None
         out = model(ids, output_hidden_states=True, logits_to_keep=1)
         hidden = out.hidden_states[-1][:, :-1, :]            # post-final-norm (B,T-1,H)
         flat_h = hidden.reshape(-1, hidden.shape[-1])
-        targets = ids[:, 1:].reshape(-1)
+        targets_2d = ids[:, 1:]
+        prediction_mask = (None if token_loss_mask is None
+                           else token_loss_mask[:, 1:].bool())
+        if prediction_mask is not None:
+            targets_2d = torch.where(prediction_mask, targets_2d,
+                                     torch.full_like(targets_2d, -100))
+        targets = targets_2d.reshape(-1)
+        flat_mask = None if prediction_mask is None else prediction_mask.reshape(-1)
         teacher_batch = None
+        teacher_hidden = {}
+        hidden_layers = tuple(int(layer) for layer in profile.quant.get("hidden_layers", ())) \
+            if profile.quant_scheme == "tq1_v" else ()
         if args.kd == "dense":
-            teacher_batch = teacher.slice_server(ids)
+            served = teacher.slice_server(ids, hidden_layers=hidden_layers)
+            if hidden_layers:
+                teacher_batch, teacher_hidden = served
+            else:
+                teacher_batch = served
         elif args.kd == "topk":
             t_idx, t_prob = cache_reader.batch(widx, ids.device)
             teacher_batch = (t_idx[:, :-1].reshape(-1, t_idx.shape[-1]),
                              t_prob[:, :-1].reshape(-1, t_prob.shape[-1]))
-        parts = loss_computer(flat_h, head_w, targets, teacher_batch)
+        parts = loss_computer(flat_h, head_w, targets, teacher_batch,
+                              loss_mask=flat_mask)
         loss = parts["loss"]
+        hidden_value = margin_value = 0.0
+        if hidden_layers and teacher_hidden:
+            hidden_losses = []
+            for layer, teacher_value in teacher_hidden.items():
+                if layer >= len(out.hidden_states):
+                    continue
+                student_value = out.hidden_states[layer][:, :-1]
+                student_norm = torch.nn.functional.normalize(student_value.float(), dim=-1)
+                teacher_norm = torch.nn.functional.normalize(
+                    teacher_value.to(student_value.device).float(), dim=-1)
+                per_token = (student_norm - teacher_norm).square().mean(-1)
+                if prediction_mask is not None:
+                    per_token = per_token[prediction_mask]
+                hidden_losses.append(per_token.mean())
+            if hidden_losses:
+                hidden_loss = torch.stack(hidden_losses).mean()
+                hidden_weight = float(profile.quant.get("lambda_hidden", 0.05))
+                loss = loss + hidden_weight * hidden_loss
+                hidden_value = float(hidden_loss.detach())
+        if profile.quant_scheme == "tq1_v":
+            from bitnet_train.tq1.qat import iter_tq1linears
+            margin_weight = float(profile.quant.get("lambda_margin", 0.01))
+            if margin_weight:
+                margins = [module.margin_loss(float(profile.quant.get("margin", 0.1)))
+                           for _, module in iter_tq1linears(raw_model)]
+                if margins:
+                    margin_loss = torch.stack(margins).mean()
+                    loss = loss + margin_weight * margin_loss
+                    margin_value = float(margin_loss.detach())
         aux_val = 0.0
         if router_hooks is not None and profile.aux_loss and aux_coef > 0:
             aux = router_hooks.aux_loss(raw_model.config.num_experts,
@@ -553,11 +678,14 @@ def main(argv=None):
             router_hooks.clear_aux()
         accelerator.backward(loss)
         return {"loss": float(loss.detach()), "ce": float(parts["ce"]),
-                "kd": float(parts["kd"]), "aux": aux_val}
+                "kd": float(parts["kd"]), "hidden": hidden_value,
+                "margin": margin_value, "aux": aux_val}
 
     from bitnet_train.bitlinear import set_lambda
 
     for step in range(start_step, total_steps):
+        if tq1_controller is not None:
+            tq1_controller.before_step(step)
         scale = lr_scale(step, args.warmup_steps, total_steps)
         for g, base in zip(optimizer.param_groups, base_lrs):
             g["lr"] = base * scale
@@ -620,16 +748,26 @@ def main(argv=None):
         if (step + 1) % args.eval_every == 0 or step + 1 == total_steps:
             ev = run_eval(model, raw_model, profile, calib, accelerator, teacher,
                           args, is_moe, router_hooks, train_mode, teacher_routing)
+            new_snap = snapshot_codes(raw_model)
+            flips = code_flip_rates(code_snapshot, new_snap)
+            code_snapshot = new_snap
+            ev["flip_total"] = flips["_total"]
+            th = ternary_health(raw_model)
+            ev["zero_frac_mean"] = sum(v["frac_zero"] for v in th.values()) / len(th)
+            ev["zero_frac_max"] = max(v["frac_zero"] for v in th.values())
+            ev["quant_rel_err_mean"] = (sum(v["quant_rel_err"] for v in th.values())
+                                        / len(th))
+            tq1_health = [value for value in th.values() if "margin_p05" in value]
+            if tq1_health:
+                ev["tq1_margin_p05"] = min(value["margin_p05"] for value in tq1_health)
+            controller_event = None
+            if tq1_controller is not None:
+                controller_event = tq1_controller.observe(step + 1, ev)
+                ev["tq1_temperature"] = controller_event["temperature"]
+                ev["tq1_export_qualified"] = float(controller_event["export_qualified"])
             if accelerator.is_main_process:
-                new_snap = snapshot_codes(raw_model)
-                flips = code_flip_rates(code_snapshot, new_snap)
-                code_snapshot = new_snap
-                ev["flip_total"] = flips["_total"]
-                th = ternary_health(raw_model)
-                ev["zero_frac_mean"] = sum(v["frac_zero"] for v in th.values()) / len(th)
-                ev["zero_frac_max"] = max(v["frac_zero"] for v in th.values())
-                ev["quant_rel_err_mean"] = (sum(v["quant_rel_err"] for v in th.values())
-                                            / len(th))
+                if controller_event is not None and controller_event["transitioned"]:
+                    say(f"step {step + 1}: TQ1 indices passed freeze gates and are frozen")
                 say(f"step {step + 1:>6}: "
                     + " ".join(f"{k}={v:.4f}" for k, v in ev.items()
                                if isinstance(v, float)))
@@ -649,13 +787,21 @@ def main(argv=None):
             model.train()
 
         if (step + 1) % args.save_every == 0 or step + 1 == total_steps:
+            training_state = ({"tq1_controller": tq1_controller.state_dict()}
+                              if tq1_controller is not None else {})
+            training_state["data_stream"] = train_iter.state_dict()
             path = save_checkpoint(accelerator, model, optimizer, run_dir, step + 1,
-                                   tokens_seen, meta, seeds={"seed": args.seed})
+                                   tokens_seen, meta, seeds={"seed": args.seed},
+                                   training_state=training_state)
             if accelerator.is_main_process:
                 say(f"saved {path}")
 
     bar.close()
     accelerator.print(f"done: {tokens_seen:,} tokens")
+    if tq1_controller is not None and not tq1_controller.export_qualified:
+        accelerator.print("TQ1 run is not export-qualified: "
+                          + (tq1_controller.failure_reason or
+                             "indices did not enter the frozen phase"))
     if health:
         try:
             health.report(run_dir, total_steps, tokens_seen)
@@ -697,7 +843,8 @@ def run_eval(model, raw_model, profile, calib, accelerator, teacher, args, is_mo
         router_hooks.stats_and_reset()                            # drop eval-pass stats
         if teacher_routing is not None:                           # §6.2 agreement pass
             router_hooks.capture_routing = True
-            raw_model(calib.to(device))
+            calib_ids = calib[0] if isinstance(calib, (tuple, list)) else calib
+            raw_model(calib_ids.to(device))
             router_hooks.capture_routing = False
             agree = router_hooks.agreement_vs_teacher(teacher_routing)
             ev["router/top8_agreement"] = agree["_mean"]

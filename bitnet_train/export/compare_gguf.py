@@ -15,6 +15,10 @@ transcribed from source, not guessed:
 
 PPL parity pairs the runtime number with the matching PyTorch eval mode
 (w_a8 <-> I2_S, w_only/a0 <-> TQ2_0 — §8.4).
+
+Schema-2 TQ1 parity consumes the canonical artifact directly.  It compares the
+GGUF tensor inventory, type/profile policy, packed payload, row-scale bit
+patterns, and codebook tensors without decoding and reassigning weights.
 """
 
 from __future__ import annotations
@@ -165,6 +169,22 @@ class TensorParityRow:
     detail: str = ""
 
 
+def parity_rows_ok(rows: list[TensorParityRow], regime: str = "preserve") -> bool:
+    """Fail closed: absence, unsupported types, or bad reconstruction never pass."""
+    if regime not in {"preserve", "requantize"}:
+        raise ValueError("regime must be preserve or requantize")
+    if not rows:
+        return False
+    for row in rows:
+        if row.status in {"skipped", "unmapped"} or not row.within_f16_bound:
+            return False
+        if regime == "preserve" and row.status != "exact":
+            return False
+        if regime == "requantize" and row.status not in {"exact", "mismatch"}:
+            return False
+    return True
+
+
 def tensor_parity(baked_dir: str | Path, gguf_path: str | Path,
                   regime: str = "preserve",
                   llama_dir: Path | None = None) -> tuple[list[TensorParityRow], bool]:
@@ -186,12 +206,16 @@ def tensor_parity(baked_dir: str | Path, gguf_path: str | Path,
     n_head = field_int(f"{arch}.attention.head_count")
     n_head_kv = field_int(f"{arch}.attention.head_count_kv")
     tmap = hf_to_gguf_name_map(gguf_mod, arch, n_layers)
+    tensor_names = [t.name for t in reader.tensors]
+    duplicate_names = sorted({name for name in tensor_names if tensor_names.count(name) > 1})
+    if duplicate_names:
+        raise ValueError(f"GGUF contains duplicate tensor names: {duplicate_names[:8]}")
     gtensors = {t.name: t for t in reader.tensors}
     baked = load_baked_tensors(baked_dir)
     ternary_names = [n for n, v in baked.items()
                      if v.ndim == 2 and _is_ternary(v)]
 
-    rows, ok = [], True
+    rows = []
     for hf_name in sorted(ternary_names):
         base = hf_name.removesuffix(".weight")
         mapped = tmap.get_name(base, try_suffixes=("",))
@@ -249,9 +273,45 @@ def tensor_parity(baked_dir: str | Path, gguf_path: str | Path,
             row = TensorParityRow(hf_name, gname, ttype, "skipped",
                                   detail=f"no decoder for {ttype}")
         rows.append(row)
-        if regime == "preserve" and row.status == "mismatch":
-            ok = False
-    return rows, ok
+    return rows, parity_rows_ok(rows, regime)
+
+
+def tq1_tensor_parity(artifact_dir: str | Path, gguf_path: str | Path) \
+        -> tuple[list[TensorParityRow], bool]:
+    """Byte-exact schema-2 canonical artifact/GGUF parity.
+
+    Validation is intentionally fail closed.  A structural or metadata failure
+    becomes a mismatch row so callers always receive a report, while no failed
+    validation can be mistaken for a successful/empty comparison.
+    """
+    from bitnet_train.tq1.artifact import ArtifactReader
+    from bitnet_train.tq1.gguf import (
+        GGML_TYPES, hf_to_gguf_name, validate_tq1_gguf)
+
+    try:
+        reader = ArtifactReader(artifact_dir)
+        reader.validate()
+    except Exception as exc:
+        row = TensorParityRow(
+            "<canonical-artifact>", "<gguf>", "TQ1_V", "mismatch",
+            within_f16_bound=False, detail=f"artifact validation failed: {exc}")
+        return [row], False
+
+    rows = [TensorParityRow(
+        item["state_dict_name"], hf_to_gguf_name(item["state_dict_name"]),
+        next(name for name, value in GGML_TYPES.items()
+             if value == GGML_TYPES[item["profile"]]),
+        "exact", detail=(
+            f"profile={item['profile']} payload/scale/codebook compared bit-exact"))
+        for item in reader.manifest["tensors"]]
+    try:
+        validate_tq1_gguf(artifact_dir, gguf_path)
+    except Exception as exc:
+        rows.append(TensorParityRow(
+            "<canonical-artifact>", "<gguf>", "TQ1_V", "mismatch",
+            within_f16_bound=False, detail=str(exc)))
+        return rows, False
+    return rows, parity_rows_ok(rows, "preserve")
 
 
 def _is_ternary(v: np.ndarray) -> bool:
@@ -292,7 +352,10 @@ def write_report(rows: list[TensorParityRow], ok: bool, out_prefix: str | Path,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--baked", required=True)
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--baked")
+    source.add_argument("--artifact",
+                        help="schema-2 canonical TQ1 artifact directory")
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--regime", default="preserve", choices=["preserve", "requantize"])
     ap.add_argument("--out", default="parity_report")
@@ -304,20 +367,31 @@ def main() -> int:
     args = ap.parse_args()
 
     from bitnet_train import provenance
-    rows, ok = tensor_parity(args.baked, args.gguf, regime=args.regime)
+    if args.artifact:
+        if args.regime != "preserve":
+            ap.error("--artifact TQ1 parity only supports --regime preserve")
+        rows, ok = tq1_tensor_parity(args.artifact, args.gguf)
+    else:
+        rows, ok = tensor_parity(args.baked, args.gguf, regime=args.regime)
     ppl = None
     if args.ppl_text:
         rt_ppl, log = runtime_ppl(args.gguf, args.ppl_text)
         ppl = {"runtime_ppl": rt_ppl, "py_ppl": args.py_ppl}
         if rt_ppl is None:
-            ppl["status"] = f"skipped: {log[:200]}"
+            ppl["status"] = f"FAIL: runtime PPL unavailable: {log[:200]}"
+            ok = False
+        elif args.py_ppl is None:
+            ppl["status"] = "FAIL: paired PyTorch PPL was not supplied"
+            ok = False
         elif args.py_ppl is not None:
             rel = abs(rt_ppl - args.py_ppl) / args.py_ppl
             ppl["rel_diff"] = rel
             ppl["status"] = "pass" if rel <= args.ppl_tol else "FAIL"
             ok = ok and rel <= args.ppl_tol
     meta = {"quantizer_hash": provenance.quantizer_hash(), "gguf": str(args.gguf),
-            "baked": str(args.baked), "regime": args.regime}
+            "baked": str(args.baked) if args.baked else None,
+            "artifact": str(args.artifact) if args.artifact else None,
+            "regime": args.regime}
     write_report(rows, ok, args.out, meta=meta, ppl=ppl)
     exact = sum(r.status == "exact" for r in rows)
     print(f"[parity] {exact}/{len(rows)} exact; overall {'PASS' if ok else 'FAIL'} "

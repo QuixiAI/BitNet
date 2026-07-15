@@ -1,0 +1,45 @@
+{
+  "coverage": {
+    "activation_mode": "a8_token",
+    "backend": "cpu",
+    "execution": [
+      "decode",
+      "small_batch",
+      "prefill"
+    ],
+    "profiles": [
+      "tq1_v11-j-b",
+      "tq1_v12-j-b",
+      "tq1_v11-j-r",
+      "tq1_v12-j-r",
+      "tq1_v11-i-r",
+      "tq1_v11-p-r",
+      "tq1_v12-p-r",
+      "tq1_v11-j-a4-r"
+    ],
+    "status": "scalar-reference"
+  },
+  "format_version": 1,
+  "ggml_type_registry_revision": 1,
+  "integration": "llama.cpp",
+  "limitations": [
+    "CPU only; unsupported backends fail closed for TQ1 tensors",
+    "Canonical artifacts must be quantized by quant/quant.py and exported by quant/export_gguf.py",
+    "The generic llama-quantize CLI does not rediscover TQ1 indices or codebooks",
+    "MUL_MAT_ID is not covered by this primary dense-Llama integration"
+  ],
+  "patch": "patches/a582222-tq1-v.patch",
+  "patch_sha256": "f742721be16d53a4f57ef89b18b1fd5c6139e59bd60f64bcd9da044a9f962a37",
+  "source": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "a5822222909b785f23ddc74ce3c8f85bd0e38562"
+  },
+  "spec_revision": "1.0.0",
+  "type_ids": {
+    "GGML_TYPE_TQ1_V11": 43,
+    "GGML_TYPE_TQ1_V11_J_A4_R": 47,
+    "GGML_TYPE_TQ1_V11_R": 45,
+    "GGML_TYPE_TQ1_V12": 44,
+    "GGML_TYPE_TQ1_V12_R": 46
+  }
+}

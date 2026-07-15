@@ -12,9 +12,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bitnet_train import quant  # noqa: E402
 from bitnet_train.export.compare_gguf import (  # noqa: E402
-    decode_tq2_0, encode_tq2_0_ref, _is_ternary)
+    TensorParityRow, decode_tq2_0, encode_tq2_0_ref, _is_ternary,
+    parity_rows_ok)
 
 rng = np.random.default_rng(0)
+
+
+def test_parity_summary_fails_closed():
+    exact = TensorParityRow("a", "a", "TQ2_0", "exact")
+    assert parity_rows_ok([exact])
+    for status in ("mismatch", "skipped", "unmapped"):
+        assert not parity_rows_ok([TensorParityRow("a", "a", "TQ2_0", status)])
+    assert not parity_rows_ok([])
+    assert not parity_rows_ok([TensorParityRow(
+        "a", "a", "TQ2_0", "exact", within_f16_bound=False)])
 
 
 def _pack_tq2_0(codes: np.ndarray, d: np.ndarray) -> np.ndarray:

@@ -47,6 +47,24 @@ for _n in ("bn_gemv_fp8", "bn_gemv_fp8_scalar", "bn_gemv_fp8_neon"):
 _lib.bn_attn_decode_kv8.argtypes = [_f32, _i8, _f32, _i8, _f32, _i64, _i64, _i64, _i64, _f32]
 _lib.bn_unpack_ternary_f32.argtypes = [_u8, _i64, _i64, _f32]
 _u16 = np.ctypeslib.ndpointer(np.uint16, flags="C")
+_TQ1_PROFILES = {
+    "tq1_v11-j-r": 0, "tq1_v11-i-r": 0, "tq1_v11-p-r": 0,
+    "tq1_v12-j-r": 1, "tq1_v12-p-r": 1,
+    "tq1_v11-j-b": 2, "tq1_v12-j-b": 3,
+    "tq1_v11-j-a4-r": 4,
+}
+_tq1_args = [_u8, _u16, _i8, _u8, _i64, _i64, _i64, C.c_int, C.c_int,
+             _i8, _f32, C.c_int, _f32]
+for _n in ("bn_tq1_gemv", "bn_tq1_gemv_scalar", "bn_tq1_gemv_neon"):
+    if hasattr(_lib, _n):
+        getattr(_lib, _n).argtypes = _tq1_args
+        getattr(_lib, _n).restype = C.c_int
+_tq1_gemm_args = [_u8, _u16, _i8, _u8, _i64, _i64, _i64, _i64,
+                  C.c_int, C.c_int, _i8, _f32, C.c_int, _f32]
+for _n in ("bn_tq1_gemm", "bn_tq1_gemm_scalar", "bn_tq1_gemm_neon"):
+    if hasattr(_lib, _n):
+        getattr(_lib, _n).argtypes = _tq1_gemm_args
+        getattr(_lib, _n).restype = C.c_int
 _lib.bn_rms_norm.argtypes = [_f32, _f32, _i64, _i64, C.c_float, _f32]
 _lib.bn_rope_neox.argtypes = [_f32, _i64, _i64, _i64, C.c_float]
 _lib.bn_kv_quant_append.argtypes = [_f32, _f32, _i64, _i64, _i64, _i8, _f32, _i8, _f32]
@@ -169,6 +187,144 @@ def prefill_ternary(wq: np.ndarray, X: np.ndarray):
     X (M, K) f32 -> (M, N)."""
     W = unpack_ternary_f32(wq)                       # (N, K)
     return X.astype(np.float32) @ W.T
+
+
+def gemv_tq1(payload: np.ndarray, row_scales: np.ndarray | None,
+             expanded_codebook: np.ndarray, legal_indices: np.ndarray,
+             xq: np.ndarray, activation_scales: np.ndarray, profile: str, *,
+             activation_mode: str = "a8_token", row_scale_dtype: str = "f16",
+             impl: str = "auto") -> np.ndarray:
+    """Native schema-2 TQ1 GEMV over canonical payload bytes.
+
+    ``expanded_codebook`` is the deterministic backend-private ``[2**bits,8]``
+    int8 repack. ``legal_indices`` is checked in the C loop, so corrupt or
+    reserved payload indices fail rather than producing an approximate output.
+    Row scales may be float16 values or raw uint16 FP16/BF16 bit patterns.
+    """
+    if profile not in _TQ1_PROFILES:
+        raise ValueError(f"unsupported native TQ1 profile {profile!r}")
+    payload = np.ascontiguousarray(payload, np.uint8)
+    if payload.ndim != 3:
+        raise ValueError("TQ1 payload must have shape [N,K/256,block_bytes]")
+    N, blocks, _ = payload.shape
+    codebook = np.ascontiguousarray(expanded_codebook, np.int8)
+    legal = np.ascontiguousarray(legal_indices, np.uint8).reshape(-1)
+    if codebook.ndim != 2 or codebook.shape[1] != 8 or legal.shape != (codebook.shape[0],):
+        raise ValueError("expanded codebook/legal-index shape mismatch")
+    if not np.all((codebook >= -1) & (codebook <= 1)):
+        raise ValueError("expanded codebook contains a non-trit")
+    xq = np.ascontiguousarray(xq, np.int8).reshape(-1)
+    if xq.shape != (blocks * 256,):
+        raise ValueError("activation width and TQ1 payload disagree")
+    if activation_mode not in {"a8_token", "a8_block256"}:
+        raise ValueError("native TQ1 GEMV requires a8_token or a8_block256")
+    act = np.ascontiguousarray(activation_scales, np.float32).reshape(-1)
+    expected_scales = blocks if activation_mode == "a8_block256" else 1
+    if act.shape != (expected_scales,) or not np.isfinite(act).all() or np.any(act < 0):
+        raise ValueError("invalid activation scale array")
+    if row_scale_dtype not in {"f16", "bf16"}:
+        raise ValueError("row_scale_dtype must be f16 or bf16")
+    if row_scales is None:
+        scale_bits = np.zeros(max(1, N), np.uint16)
+    else:
+        values = np.asarray(row_scales)
+        if values.shape != (N,):
+            raise ValueError("row scales must have shape [N]")
+        if values.dtype == np.float16:
+            if row_scale_dtype != "f16":
+                raise ValueError("BF16 scales must be supplied as raw uint16 bits")
+            scale_bits = np.ascontiguousarray(values).view(np.uint16)
+        elif values.dtype == np.uint16:
+            scale_bits = np.ascontiguousarray(values)
+        else:
+            raise ValueError("row scales must be float16 values or uint16 bits")
+    out = np.empty(N, np.float32)
+    fn = {"auto": _lib.bn_tq1_gemv,
+          "scalar": _lib.bn_tq1_gemv_scalar,
+          "neon": getattr(_lib, "bn_tq1_gemv_neon", None)}.get(impl)
+    if fn is None:
+        raise ValueError(f"native TQ1 implementation {impl!r} is unavailable")
+    status = fn(payload.reshape(-1), scale_bits, codebook.reshape(-1), legal,
+                codebook.shape[0], N, blocks * 256, _TQ1_PROFILES[profile],
+                int(row_scale_dtype == "bf16"), xq, act,
+                int(activation_mode == "a8_block256"), out)
+    if status:
+        reasons = {
+            -1: "unsupported profile", -2: "invalid dimensions or pointers",
+            -3: "invalid scale", -4: "reserved or out-of-range index",
+            -5: "reserved A4 metadata", -6: "nonfinite output",
+        }
+        raise ValueError(f"native TQ1 GEMV rejected input: {reasons.get(status, status)}")
+    return out
+
+
+def gemm_tq1(payload: np.ndarray, row_scales: np.ndarray | None,
+             expanded_codebook: np.ndarray, legal_indices: np.ndarray,
+             xq: np.ndarray, activation_scales: np.ndarray, profile: str, *,
+             activation_mode: str = "a8_token", row_scale_dtype: str = "f16",
+             impl: str = "auto") -> np.ndarray:
+    """Native packed TQ1 matrix multiply for small-batch decode/prefill.
+
+    Activations are already A8-quantized: ``xq`` is ``[M,K]`` and scales are
+    ``[M,1]`` for token mode or ``[M,K/256]`` for block mode.
+    """
+    if profile not in _TQ1_PROFILES:
+        raise ValueError(f"unsupported native TQ1 profile {profile!r}")
+    payload = np.ascontiguousarray(payload, np.uint8)
+    if payload.ndim != 3:
+        raise ValueError("TQ1 payload must have shape [N,K/256,block_bytes]")
+    N, blocks, _ = payload.shape
+    codebook = np.ascontiguousarray(expanded_codebook, np.int8)
+    legal = np.ascontiguousarray(legal_indices, np.uint8).reshape(-1)
+    if codebook.ndim != 2 or codebook.shape[1] != 8 or legal.shape != (codebook.shape[0],):
+        raise ValueError("expanded codebook/legal-index shape mismatch")
+    if not np.all((codebook >= -1) & (codebook <= 1)):
+        raise ValueError("expanded codebook contains a non-trit")
+    values = np.ascontiguousarray(xq, np.int8)
+    if values.ndim != 2 or values.shape[1] != blocks * 256 or values.shape[0] <= 0:
+        raise ValueError("A8 code matrix must have shape [M,K]")
+    M = values.shape[0]
+    if activation_mode not in {"a8_token", "a8_block256"}:
+        raise ValueError("native TQ1 GEMM requires a8_token or a8_block256")
+    scales_per_token = blocks if activation_mode == "a8_block256" else 1
+    act = np.ascontiguousarray(activation_scales, np.float32)
+    if act.shape != (M, scales_per_token) or not np.isfinite(act).all() \
+            or np.any(act < 0):
+        raise ValueError("invalid activation scale matrix")
+    if row_scale_dtype not in {"f16", "bf16"}:
+        raise ValueError("row_scale_dtype must be f16 or bf16")
+    if row_scales is None:
+        scale_bits = np.zeros(max(1, N), np.uint16)
+    else:
+        scale_values = np.asarray(row_scales)
+        if scale_values.shape != (N,):
+            raise ValueError("row scales must have shape [N]")
+        if scale_values.dtype == np.float16:
+            if row_scale_dtype != "f16":
+                raise ValueError("BF16 scales must be supplied as raw uint16 bits")
+            scale_bits = np.ascontiguousarray(scale_values).view(np.uint16)
+        elif scale_values.dtype == np.uint16:
+            scale_bits = np.ascontiguousarray(scale_values)
+        else:
+            raise ValueError("row scales must be float16 values or uint16 bits")
+    out = np.empty((M, N), np.float32)
+    fn = {"auto": _lib.bn_tq1_gemm,
+          "scalar": _lib.bn_tq1_gemm_scalar,
+          "neon": getattr(_lib, "bn_tq1_gemm_neon", None)}.get(impl)
+    if fn is None:
+        raise ValueError(f"native TQ1 implementation {impl!r} is unavailable")
+    status = fn(payload.reshape(-1), scale_bits, codebook.reshape(-1), legal,
+                codebook.shape[0], M, N, blocks * 256, _TQ1_PROFILES[profile],
+                int(row_scale_dtype == "bf16"), values.reshape(-1), act.reshape(-1),
+                int(activation_mode == "a8_block256"), out.reshape(-1))
+    if status:
+        reasons = {
+            -1: "unsupported profile", -2: "invalid dimensions or pointers",
+            -3: "invalid scale", -4: "reserved or out-of-range index",
+            -5: "reserved A4 metadata", -6: "nonfinite output",
+        }
+        raise ValueError(f"native TQ1 GEMM rejected input: {reasons.get(status, status)}")
+    return out
 
 
 # ---- decode glue (RMSNorm / RoPE / KV writer) ----

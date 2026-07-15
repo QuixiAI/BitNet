@@ -34,33 +34,42 @@ ROW_CHUNK = 128
 
 
 @torch.no_grad()
-def window_ce(model, ids: torch.Tensor, row_chunk: int = ROW_CHUNK) -> tuple[float, int]:
+def window_ce(model, ids: torch.Tensor, row_chunk: int = ROW_CHUNK,
+              loss_mask: torch.Tensor | None = None) -> tuple[float, int]:
     """Sum of next-token CE (nats) and token count for one (B, T) batch,
     row-chunked so logits are cast to fp32 only a slice at a time."""
     out = model(ids)
     logits = out.logits[:, :-1, :]
     targets = ids[:, 1:]
+    target_mask = None if loss_mask is None else loss_mask[:, 1:].bool()
     total, count = 0.0, 0
     for s in range(0, targets.shape[1], row_chunk):
         sl = logits[:, s:s + row_chunk, :].float()
         tg = targets[:, s:s + row_chunk]
+        if target_mask is not None:
+            mask = target_mask[:, s:s + row_chunk]
+            tg = torch.where(mask, tg, torch.full_like(tg, -100))
+            count += int(mask.sum())
+        else:
+            count += tg.numel()
         total += float(F.cross_entropy(sl.reshape(-1, sl.shape[-1]), tg.reshape(-1),
-                                       reduction="sum"))
-        count += tg.numel()
+                                       ignore_index=-100, reduction="sum"))
     return total, count
 
 
 @torch.no_grad()
-def evaluate_ppl(model, windows: torch.Tensor, device, batch_size: int = 1,
+def evaluate_ppl(model, windows, device, batch_size: int = 1,
                  mode: str | None = None) -> dict:
     """PPL over the calibration windows in one eval mode (None = leave as-is)."""
     if mode is not None:
         set_eval_mode(model, mode)
     model.eval()
     total, count = 0.0, 0
-    for i in range(0, windows.shape[0], batch_size):
-        ids = windows[i:i + batch_size].to(device)
-        t, c = window_ce(model, ids)
+    ids_windows, masks = windows if isinstance(windows, (tuple, list)) else (windows, None)
+    for i in range(0, ids_windows.shape[0], batch_size):
+        ids = ids_windows[i:i + batch_size].to(device)
+        mask = None if masks is None else masks[i:i + batch_size].to(device)
+        t, c = window_ce(model, ids, loss_mask=mask)
         total += t
         count += c
     ce = total / max(count, 1)
@@ -69,25 +78,31 @@ def evaluate_ppl(model, windows: torch.Tensor, device, batch_size: int = 1,
 
 
 @torch.no_grad()
-def kl_tf(student, teacher, windows: torch.Tensor, device, tau: float = 1.0,
+def kl_tf(student, teacher, windows, device, tau: float = 1.0,
           batch_size: int = 1, row_chunk: int = ROW_CHUNK) -> float:
     """Teacher-forced KL(teacher ‖ student) per token on the calibration set —
     the truest healing gauge (train_plan §10.1). Row-chunked."""
     student.eval()
     teacher.eval()
     total, count = 0.0, 0
-    for i in range(0, windows.shape[0], batch_size):
-        ids = windows[i:i + batch_size].to(device)
-        s_logits = student(ids).logits
-        t_logits = teacher(ids).logits
-        T = ids.shape[1]
+    ids_windows, masks = windows if isinstance(windows, (tuple, list)) else (windows, None)
+    for i in range(0, ids_windows.shape[0], batch_size):
+        ids = ids_windows[i:i + batch_size].to(device)
+        s_logits = student(ids).logits[:, :-1]
+        t_logits = teacher(ids).logits[:, :-1]
+        T = ids.shape[1] - 1
         for s in range(0, T, row_chunk):
             sl = s_logits[:, s:s + row_chunk, :].float() / tau
             tl = t_logits[:, s:s + row_chunk, :].float() / tau
             p_t = F.softmax(tl, dim=-1)
             kl = (p_t * (F.log_softmax(tl, -1) - F.log_softmax(sl, -1))).sum(-1)
-            total += float(kl.sum())
-            count += kl.numel()
+            if masks is not None:
+                mask = masks[i:i + batch_size, 1:][:, s:s + row_chunk].to(device).bool()
+                total += float((kl * mask).sum())
+                count += int(mask.sum())
+            else:
+                total += float(kl.sum())
+                count += kl.numel()
     return total / max(count, 1)
 
 
@@ -118,8 +133,8 @@ def main() -> int:
 
     report = {
         "ckpt": str(args.ckpt),
-        "calib_windows": int(windows.shape[0]),
-        "seq_len": int(windows.shape[1]),
+        "calib_windows": int((windows[0] if isinstance(windows, tuple) else windows).shape[0]),
+        "seq_len": int((windows[0] if isinstance(windows, tuple) else windows).shape[1]),
         "meta": provenance.build_meta(profile_path=args.profile,
                                       model_config=model.config,
                                       data_manifest=load_manifest(args.data_dir)),

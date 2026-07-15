@@ -69,6 +69,10 @@ class ArchProfile:
     def group_k(self) -> int:
         return int(self.quant.get("group_k") or 32)
 
+    @property
+    def quant_scheme(self) -> str:
+        return str(self.quant.get("scheme", "scalar_ternary"))
+
 
 def load_profile(path: str | Path) -> ArchProfile:
     raw = yaml.safe_load(Path(path).read_text())
@@ -79,8 +83,34 @@ def load_profile(path: str | Path) -> ArchProfile:
     extras = {k: raw.pop(k) for k in list(raw) if k not in known}
     prof = ArchProfile(param_groups=groups, extras=extras,
                        name=raw.pop("name", Path(path).stem), **raw)
-    if prof.granularity not in ("tensor", "group"):
-        raise ValueError(f"profile {prof.name}: bad granularity {prof.granularity!r}")
+    if prof.quant_scheme == "scalar_ternary":
+        allowed = {"scheme", "granularity", "group_k"}
+        unknown = set(prof.quant) - allowed
+        if unknown:
+            raise ValueError(f"profile {prof.name}: unknown scalar quant keys {sorted(unknown)}")
+        if prof.granularity not in ("tensor", "group"):
+            raise ValueError(f"profile {prof.name}: bad granularity {prof.granularity!r}")
+    elif prof.quant_scheme == "tq1_v":
+        allowed = {
+            "scheme", "spec", "artifact", "default_profile", "default_codebook_id",
+            "activation_mode", "importance_stats", "qat_projection", "candidate_count",
+            "top_m", "temperature_start", "temperature_end", "soft_steps", "hard_steps",
+            "freeze_indices_at", "margin", "lambda_margin", "tensor_overrides",
+            "assignment_chunk", "lambda_hidden", "hidden_layers",
+            "freeze_max_step", "freeze_flip_threshold", "freeze_margin_threshold",
+            "freeze_sustain_evals", "freeze_trend_tolerance",
+        }
+        unknown = set(prof.quant) - allowed
+        if unknown:
+            raise ValueError(f"profile {prof.name}: unknown TQ1 quant keys {sorted(unknown)}")
+        required = {"artifact", "default_profile", "default_codebook_id", "qat_projection"}
+        missing = required - set(prof.quant)
+        if missing:
+            raise ValueError(f"profile {prof.name}: missing TQ1 quant keys {sorted(missing)}")
+        if prof.quant["qat_projection"] not in {"soft", "hard", "frozen"}:
+            raise ValueError("training profile qat_projection must be soft, hard, or frozen")
+    else:
+        raise ValueError(f"profile {prof.name}: unknown quant scheme {prof.quant_scheme!r}")
     return prof
 
 
@@ -145,11 +175,14 @@ def _family(name: str) -> str:
 
 
 def convert(model: nn.Module, profile: ArchProfile,
-            backend: str = "reference") -> ConversionReport:
+            backend: str = "reference", tq1_artifact: str | Path | None = None) -> ConversionReport:
     """In-place swap of the profile's target linears for BitLinear (fp32 latent)
     and fused expert stacks for BitExperts. Never touches model.config (config
     preservation is a hard requirement)."""
     from bitnet_train.bitlinear import BitExperts
+
+    if profile.quant_scheme == "tq1_v":
+        return _convert_tq1(model, profile, tq1_artifact)
 
     classes = classify_linears(model, profile)
     tern_names = [n for n, c in classes.items() if c == TERNARIZE]
@@ -207,14 +240,97 @@ def convert(model: nn.Module, profile: ArchProfile,
 
 
 def load_converted(ckpt_dir: str | Path, profile: ArchProfile,
-                   backend: str = "reference", dtype=torch.float32):
+                   backend: str = "reference", dtype=torch.float32,
+                   tq1_artifact: str | Path | None = None):
     """Load a converted checkpoint: BitLinear's state dict is key/shape-identical to
     a bias-free nn.Linear, so from_pretrained restores the latents into plain
     Linears and convert() re-wraps them (weights are copied into fp32 latents)."""
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(str(ckpt_dir), torch_dtype=dtype)
-    report = convert(model, profile, backend=backend)
+    report = convert(model, profile, backend=backend, tq1_artifact=tq1_artifact)
     return model, report
+
+
+def _convert_tq1(model: nn.Module, profile: ArchProfile,
+                  artifact_path: str | Path | None) -> ConversionReport:
+    from bitnet_train.tq1.artifact import ArtifactReader
+    from bitnet_train.tq1.calibration import load_calibration_artifact
+    from bitnet_train.tq1.packing import unpack_payload
+    from bitnet_train.tq1.qat import TQ1Linear
+    from bitnet_train.tq1.spec import FLOAT_PROFILES
+
+    artifact_path = artifact_path or profile.quant.get("artifact")
+    if not artifact_path:
+        raise ValueError("TQ1 conversion requires a canonical artifact")
+    reader = ArtifactReader(artifact_path)
+    reader.validate()
+    quant_spec = reader.quant_spec
+    if profile.quant.get("default_profile") != quant_spec.default_profile:
+        raise ValueError("profile default TQ1 format differs from canonical artifact")
+    if profile.quant.get("default_codebook_id") != quant_spec.default_codebook_id:
+        raise ValueError("profile default codebook differs from canonical artifact")
+    configured_spec = profile.quant.get("spec")
+    if configured_spec:
+        raw = json.loads(Path(configured_spec).read_text())
+        from bitnet_train.tq1.spec import QuantSpec
+        expected = QuantSpec.from_dict(raw)
+        if expected.sha256() != quant_spec.sha256():
+            raise ValueError("profile QuantSpec differs from canonical artifact")
+    registry = reader.registry()
+    statistics = {}
+    if profile.quant.get("importance_stats"):
+        statistics, _ = load_calibration_artifact(profile.quant["importance_stats"])
+
+    classes = classify_linears(model, profile)
+    configured_targets = sorted(name for name, kind in classes.items() if kind == TERNARIZE)
+    target_names = sorted(
+        name for name in configured_targets
+        if quant_spec.resolve_profile(name)[0] not in FLOAT_PROFILES)
+    float_overrides = sorted(set(configured_targets) - set(target_names))
+    kept = sorted([name for name, kind in classes.items() if kind == KEEP_FP]
+                  + float_overrides)
+    artifact_names = sorted(item["module_path"] for item in reader.manifest["tensors"])
+    if artifact_names != target_names:
+        raise ValueError(f"TQ1 artifact/profile inventory mismatch: expected={target_names}, "
+                         f"artifact={artifact_names}")
+    tern_params = 0
+    for name in target_names:
+        old: nn.Linear = model.get_submodule(name)
+        if old.bias is not None:
+            raise ValueError(f"{name}: TQ1Linear is bias-free")
+        item, payload, scales = reader.tensor(name + ".weight")
+        if scales is None:
+            raise ValueError(f"{name}: QAT requires a row-scale artifact profile")
+        indices, _, _ = unpack_payload(payload, item["profile"])
+        codebook = registry[item["codebook_id"]]
+        diag = statistics.get(name + ".diag")
+        cov8 = statistics.get(name + ".cov8")
+        new = TQ1Linear(
+            old.weight.detach(), scales, codebook, quant_spec,
+            profile=item["profile"], importance_diag=diag,
+            importance_cov8=cov8, initial_indices=indices,
+            phase=profile.quant.get("qat_projection", "soft"),
+            top_m=int(profile.quant.get("top_m", 8)),
+            temperature=float(profile.quant.get("temperature_start", 1.0)),
+            assignment_chunk=int(profile.quant.get("assignment_chunk", 2048)),
+        )
+        new.weight.requires_grad_(old.weight.requires_grad)
+        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+        setattr(parent, name.rsplit(".", 1)[-1], new)
+        tern_params += new.weight.numel()
+    total_params = sum(parameter.numel() for parameter in model.parameters())
+    lin_flops = tern_params + sum(
+        module.weight.numel() for module_name, module in model.named_modules()
+        if isinstance(module, nn.Linear))
+    family_counts: dict[str, int] = {}
+    for name in target_names:
+        family_counts[_family(name)] = family_counts.get(_family(name), 0) + 1
+    return ConversionReport(
+        profile=profile.name, n_ternarized=len(target_names), n_kept_fp=len(kept),
+        ternarized=target_names, kept_fp=kept, family_counts=family_counts,
+        ternary_param_fraction=tern_params / max(total_params, 1),
+        ternary_flop_fraction=tern_params / max(lin_flops, 1),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -232,16 +348,33 @@ def build_param_groups(model: nn.Module, profile: ArchProfile, base_lr: float,
     if profile.param_groups is None:
         bit_ids = {id(m.weight) for m in model.modules() if isinstance(m, BitLinear)}
         bit_ids |= {id(p) for m in model.modules() if isinstance(m, BitExperts)
-                    for p in m.parameters()}
+                     for p in m.parameters()}
+        tq1_scale_ids: set[int] = set()
+        if profile.quant_scheme == "tq1_v":
+            from bitnet_train.tq1.qat import TQ1Linear
+            tq1_modules = [module for module in model.modules() if isinstance(module, TQ1Linear)]
+            bit_ids |= {id(module.weight) for module in tq1_modules}
+            tq1_scale_ids = {id(module.scale_parameter) for module in tq1_modules}
         latents = [p for p in model.parameters() if id(p) in bit_ids and p.requires_grad]
         rest = [p for p in model.parameters()
-                if id(p) not in bit_ids and p.requires_grad]
-        return [
+                if id(p) not in bit_ids and id(p) not in tq1_scale_ids and p.requires_grad]
+        groups = [
             {"params": latents, "lr": base_lr, "weight_decay": weight_decay,
              "name": "bitlinear_latents", "decay_masked": False},
-            {"params": rest, "lr": base_lr, "weight_decay": 0.0,
-             "name": "other", "decay_masked": False},
         ]
+        if tq1_scale_ids:
+            groups.append({
+                "params": [p for p in model.parameters()
+                           if id(p) in tq1_scale_ids and p.requires_grad],
+                "lr": base_lr * 0.1, "weight_decay": 0.0,
+                "name": "tq1_row_scales", "decay_masked": False,
+            })
+        groups.append(
+            {"params": rest, "lr": base_lr * (0.1 if tq1_scale_ids else 1.0),
+             "weight_decay": 0.0,
+             "name": "other", "decay_masked": False},
+        )
+        return groups
 
     specs = [(re.compile(g.match), g) for g in profile.param_groups]
     buckets: dict[str, list] = {g.name: [] for g in profile.param_groups}

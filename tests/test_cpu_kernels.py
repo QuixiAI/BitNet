@@ -50,6 +50,21 @@ def test_act_quant():
     np.testing.assert_array_equal(xq, q_ref)
 
 
+def test_act_quant_divides_by_scale_at_half_even_boundary():
+    # For this exact FP32 pair, x / scale is -81.5 while
+    # x * (1 / scale) rounds to -81.49999. The format contract requires the
+    # former operation and therefore the even code -82.
+    x = np.array([1.6625983, -1.0669429, 0.0], dtype=np.float32)
+    scale = np.float32(np.max(np.abs(x)) / np.float32(127.0))
+    divided = np.rint(x / scale).clip(-127, 127).astype(np.int8)
+    reciprocal = np.rint(
+        x * np.float32(1.0 / scale)).clip(-127, 127).astype(np.int8)
+    assert divided[1] == -82 and reciprocal[1] == -81
+    codes, observed_scale = bn.act_quant_int8(x)
+    assert observed_scale == scale
+    np.testing.assert_array_equal(codes, divided)
+
+
 @pytest.mark.parametrize("pt", [False, True])
 @pytest.mark.parametrize("impl", ["scalar", "neon"])
 def test_gemv_w2a8(pt, impl):

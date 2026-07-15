@@ -154,6 +154,14 @@ def set_eval_mode(model: nn.Module, mode: str,
         mod.act_quant = aq
     for _, mod in iter_bitexperts(model):
         mod.act_quant = aq
+    try:
+        from bitnet_train.tq1.qat import iter_tq1linears
+        for _, mod in iter_tq1linears(model):
+            configured = getattr(mod, "_configured_activation_mode", mod.activation_mode)
+            mod._configured_activation_mode = configured
+            mod.activation_mode = configured if aq else "none"
+    except ImportError:  # pragma: no cover - optional during minimal installs
+        pass
 
     from torch.nn.utils import parametrize
     want_fp8 = (mode == "b")
@@ -238,6 +246,14 @@ def snapshot_codes(model: nn.Module) -> dict[str, torch.Tensor]:
         for slice_name, w in mod.expert_slices():
             out[f"{name}.{slice_name}"] = quant.ternary_codes(
                 w, mod.granularity, mod.group_k)[0].cpu()
+    try:
+        from bitnet_train.tq1.qat import iter_tq1linears
+        for name, mod in iter_tq1linears(model):
+            with torch.no_grad():
+                mod.projection(mod.runtime_scales())
+            out[name] = mod.indices.detach().cpu().clone()
+    except ImportError:  # pragma: no cover
+        pass
     return out
 
 
@@ -310,4 +326,24 @@ def ternary_health(model: nn.Module) -> dict[str, dict[str, float]]:
                 "latent_norm": wn,
                 "quant_rel_err": float((w_deq.float() - w.float()).norm()) / max(wn, 1e-20),
             }
+    try:
+        from bitnet_train.tq1.qat import iter_tq1linears
+        for name, mod in iter_tq1linears(model):
+            metrics = mod.health()
+            out[name] = {
+                "frac_neg": metrics["frac_neg"],
+                "frac_zero": metrics["frac_zero"],
+                "frac_pos": metrics["frac_pos"],
+                "absmean_scale": metrics["scale_median"],
+                "latent_norm": float(mod.weight.detach().float().norm()),
+                "quant_rel_err": float((mod.projected_weight().detach().float()
+                                        - mod.weight.detach().float()).norm())
+                                  / max(float(mod.weight.detach().float().norm()), 1e-20),
+                "index_flip_rate": metrics["index_flip_rate"],
+                "margin_p05": metrics["margin_p05"],
+                "codebook_entropy": metrics["codebook_entropy"],
+                "dead_codewords": metrics["dead_codewords"],
+            }
+    except ImportError:  # pragma: no cover
+        pass
     return out
