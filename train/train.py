@@ -408,6 +408,27 @@ def main(argv=None):
                                else "reference")
     if args.init is None:
         raise SystemExit("--init is required (run train/init_from_base.py first)")
+
+    # Resolve the physical run length before loading model weights.  TQ1 phase
+    # boundaries are global-token positions, so a schedule that cannot be
+    # reached or represented by this launch must fail before an expensive load.
+    train_ds = PackedWindows(args.data_dir, "train", args.seq_len)
+    tokens_per_step = (args.batch_size * args.grad_accum * args.seq_len
+                       * accelerator.num_processes)
+    requested_tokens = (args.total_tokens if args.total_tokens is not None
+                        else len(train_ds) * args.seq_len * args.epochs)
+    if isinstance(requested_tokens, bool) or not isinstance(requested_tokens, (int, float)) \
+            or not math.isfinite(requested_tokens) or requested_tokens <= 0:
+        raise ValueError("the requested training token budget must be finite and positive")
+    total_steps = max(1, math.ceil(requested_tokens / tokens_per_step))
+    total_tokens = total_steps * tokens_per_step
+    tq1_schedule = None
+    if profile.quant_scheme == "tq1_v":
+        from bitnet_train.tq1.curriculum import schedule_from_config
+        tq1_schedule = schedule_from_config(profile.quant)
+        tq1_schedule.validate_run(total_tokens=total_tokens,
+                                  tokens_per_step=tokens_per_step)
+
     ckpt = args.resume or args.init
     latent_dtype = torch.bfloat16 if args.latent_dtype == "bf16" else torch.float32
     model, conv_report = load_converted(
@@ -430,18 +451,11 @@ def main(argv=None):
         router_hooks.collect_aux = profile.aux_loss
 
     # ---- data
-    train_ds = PackedWindows(args.data_dir, "train", args.seq_len)
     train_loader = make_loader(IndexedWindows(train_ds), args.batch_size, args.seed)
     calib = calibration_windows(args.data_dir, args.calib_windows,
                                 split="val" if "val" in train_ds.manifest["splits"]
                                 else "train", seq_len=args.seq_len)
     calib_ids = calib[0] if isinstance(calib, (tuple, list)) else calib
-
-    tokens_per_step = (args.batch_size * args.grad_accum * args.seq_len
-                       * accelerator.num_processes)
-    total_tokens = args.total_tokens if args.total_tokens is not None \
-        else len(train_ds) * args.seq_len * args.epochs
-    total_steps = max(1, math.ceil(total_tokens / tokens_per_step))
 
     # ---- optimizer (§5.2): AdamW(0.9, 0.95); wd on 2-D latents only; Q groups via profile
     groups = build_param_groups(model, profile, args.lr, weight_decay=args.weight_decay)
@@ -465,26 +479,11 @@ def main(argv=None):
     # ---- exact TQ1 curriculum (soft -> hard -> gate-qualified frozen)
     tq1_controller = None
     if profile.quant_scheme == "tq1_v":
-        from bitnet_train.tq1.curriculum import QATController, QATSchedule
+        from bitnet_train.tq1.curriculum import QATController
         from bitnet_train.tq1.qat import iter_tq1linears
-        q = profile.quant
         tq1_controller = QATController(
             [module for _, module in iter_tq1linears(raw_model)],
-            QATSchedule(
-                initial_phase=str(q["qat_projection"]),
-                temperature_start=float(q.get("temperature_start", 1.0)),
-                temperature_end=float(q.get("temperature_end", 0.05)),
-                soft_steps=int(q.get("soft_steps", 1000)),
-                hard_steps=int(q.get("hard_steps", 4000)),
-                freeze_indices_at=(None if q.get("freeze_indices_at") is None
-                                   else int(q["freeze_indices_at"])),
-                freeze_max_step=(None if q.get("freeze_max_step") is None
-                                 else int(q["freeze_max_step"])),
-                flip_threshold=float(q.get("freeze_flip_threshold", 1e-4)),
-                margin_threshold=float(q.get("freeze_margin_threshold", 0.0)),
-                sustain_evals=int(q.get("freeze_sustain_evals", 3)),
-                trend_tolerance=float(q.get("freeze_trend_tolerance", 0.01)),
-            ))
+            tq1_schedule)
 
     # ---- teacher / KD (§5.1: KD by default; live dense teacher for A-track)
     teacher = cache_reader = None
@@ -512,6 +511,8 @@ def main(argv=None):
             "quant_spec_sha256": first_tq1.quant_spec_sha256,
             "source_artifact": str(args.tq1_artifact or profile.quant.get("artifact")),
             "schedule": tq1_controller.state_dict()["schedule"],
+            "tokens_per_step": tokens_per_step,
+            "world_size": accelerator.num_processes,
             "codebooks": sorted({module.codebook_id: module.codebook_sha256
                                   for module in tq1_controller.modules}.items()),
             "importance_stats": profile.quant.get("importance_stats"),
@@ -547,7 +548,22 @@ def main(argv=None):
             controller_state = resume_training_state.get("tq1_controller")
             if controller_state is None:
                 raise RuntimeError("TQ1 checkpoint lacks resumable curriculum state")
+            launch_state = resume_training_state.get("tq1_launch")
+            expected_launch = {
+                "tokens_per_step": tokens_per_step,
+                "world_size": accelerator.num_processes,
+            }
+            if launch_state != expected_launch:
+                raise RuntimeError(
+                    "TQ1 checkpoint launch geometry differs from this resume: "
+                    f"checkpoint={launch_state}, current={expected_launch}")
             tq1_controller.load_state_dict(controller_state)
+            tq1_controller.validate_position(tokens_seen)
+            if tokens_seen != start_step * tokens_per_step:
+                raise RuntimeError(
+                    "TQ1 checkpoint step/token position does not match this launch: "
+                    f"step={start_step}, tokens={tokens_seen}, "
+                    f"tokens_per_step={tokens_per_step}")
         if "rng_states" in st.get("meta", {}):
             provenance.rng_restore(st["meta"]["rng_states"])
 
@@ -601,6 +617,23 @@ def main(argv=None):
             # routing is defined over all tokens; assistant masks affect losses only.
             raw_model.config.num_experts_per_tok)     # Q-T0 §8.1 fixture
     code_snapshot = snapshot_codes(raw_model)
+    gate_code_snapshot = resume_training_state.get("tq1_gate_code_snapshot")
+    if tq1_controller is not None:
+        if args.resume and gate_code_snapshot is None:
+            raise RuntimeError("TQ1 checkpoint lacks the freeze-gate code snapshot")
+        if gate_code_snapshot is None:
+            gate_code_snapshot = {name: value.clone()
+                                  for name, value in code_snapshot.items()}
+        else:
+            # Validate keys and shapes immediately instead of failing at the
+            # next potentially distant gate observation.
+            if set(gate_code_snapshot) != set(code_snapshot) or any(
+                    not isinstance(gate_code_snapshot[name], torch.Tensor)
+                    or gate_code_snapshot[name].shape != value.shape
+                    or gate_code_snapshot[name].dtype != value.dtype
+                    for name, value in code_snapshot.items()):
+                raise RuntimeError("TQ1 checkpoint freeze-gate snapshot inventory mismatch")
+            code_flip_rates(gate_code_snapshot, code_snapshot)
     t0, tokens0 = time.time(), tokens_seen
     model.train()
 
@@ -685,7 +718,7 @@ def main(argv=None):
 
     for step in range(start_step, total_steps):
         if tq1_controller is not None:
-            tq1_controller.before_step(step)
+            tq1_controller.before_step(tokens_seen)
         scale = lr_scale(step, args.warmup_steps, total_steps)
         for g, base in zip(optimizer.param_groups, base_lrs):
             g["lr"] = base * scale
@@ -705,6 +738,8 @@ def main(argv=None):
                     masker.step(router_hooks.routed_and_reset())
                 optimizer.zero_grad()
         tokens_seen += tokens_per_step
+        if tq1_controller is not None:
+            tq1_controller.after_step(tokens_seen)
 
         if args.empty_cache_every and (step + 1) % args.empty_cache_every == 0:
             if torch.backends.mps.is_available():
@@ -745,7 +780,10 @@ def main(argv=None):
                                  "tokens_per_s": tps}, step=step + 1)
             t0, tokens0 = time.time(), tokens_seen
 
-        if (step + 1) % args.eval_every == 0 or step + 1 == total_steps:
+        gate_observation = (tq1_controller is not None
+                            and tq1_controller.observation_due(tokens_seen))
+        if ((step + 1) % args.eval_every == 0 or step + 1 == total_steps
+                or gate_observation):
             ev = run_eval(model, raw_model, profile, calib, accelerator, teacher,
                           args, is_moe, router_hooks, train_mode, teacher_routing)
             new_snap = snapshot_codes(raw_model)
@@ -762,12 +800,23 @@ def main(argv=None):
                 ev["tq1_margin_p05"] = min(value["margin_p05"] for value in tq1_health)
             controller_event = None
             if tq1_controller is not None:
-                controller_event = tq1_controller.observe(step + 1, ev)
+                if gate_observation:
+                    gate_flips = code_flip_rates(gate_code_snapshot, new_snap)
+                    gate_code_snapshot = {name: value.clone()
+                                          for name, value in new_snap.items()}
+                    gate_metrics = dict(ev)
+                    gate_metrics["flip_total"] = gate_flips["_total"]
+                    controller_event = tq1_controller.observe(tokens_seen, gate_metrics)
+                    ev["tq1_gate_flip_total"] = gate_flips["_total"]
+                else:
+                    controller_event = tq1_controller.status()
                 ev["tq1_temperature"] = controller_event["temperature"]
                 ev["tq1_export_qualified"] = float(controller_event["export_qualified"])
+                ev["tq1_gate_observation"] = float(gate_observation)
             if accelerator.is_main_process:
                 if controller_event is not None and controller_event["transitioned"]:
-                    say(f"step {step + 1}: TQ1 indices passed freeze gates and are frozen")
+                    say(f"step {step + 1} ({tokens_seen:,} tokens): "
+                        "TQ1 indices passed freeze gates and are frozen")
                 say(f"step {step + 1:>6}: "
                     + " ".join(f"{k}={v:.4f}" for k, v in ev.items()
                                if isinstance(v, float)))
@@ -786,22 +835,38 @@ def main(argv=None):
                                      if isinstance(v, (int, float))}, step=step + 1)
             model.train()
 
-        if (step + 1) % args.save_every == 0 or step + 1 == total_steps:
+        curriculum_failed = (tq1_controller is not None
+                             and tq1_controller.failure_reason is not None)
+        if ((step + 1) % args.save_every == 0 or step + 1 == total_steps
+                or curriculum_failed):
             training_state = ({"tq1_controller": tq1_controller.state_dict()}
                               if tq1_controller is not None else {})
+            if tq1_controller is not None:
+                training_state["tq1_gate_code_snapshot"] = gate_code_snapshot
+                training_state["tq1_launch"] = {
+                    "tokens_per_step": tokens_per_step,
+                    "world_size": accelerator.num_processes,
+                }
             training_state["data_stream"] = train_iter.state_dict()
             path = save_checkpoint(accelerator, model, optimizer, run_dir, step + 1,
                                    tokens_seen, meta, seeds={"seed": args.seed},
                                    training_state=training_state)
             if accelerator.is_main_process:
                 say(f"saved {path}")
+        if curriculum_failed:
+            break
 
     bar.close()
-    accelerator.print(f"done: {tokens_seen:,} tokens")
+    run_complete = tq1_controller is None or tq1_controller.export_qualified
+    accelerator.print(
+        f"{'done' if run_complete else 'stopped'}: {tokens_seen:,} tokens")
+    qualification_error = None
     if tq1_controller is not None and not tq1_controller.export_qualified:
-        accelerator.print("TQ1 run is not export-qualified: "
-                          + (tq1_controller.failure_reason or
-                             "indices did not enter the frozen phase"))
+        message = (tq1_controller.failure_reason or
+                   "indices did not enter the frozen phase")
+        accelerator.print("TQ1 run is not export-qualified: " + message)
+        qualification_error = RuntimeError(
+            "TQ1 run failed export qualification: " + message)
     if health:
         try:
             health.report(run_dir, total_steps, tokens_seen)
@@ -809,6 +874,8 @@ def main(argv=None):
             accelerator.print(f"WARNING: health report failed ({e})")
     if args.wandb:
         accelerator.end_training()
+    if qualification_error is not None:
+        raise qualification_error
     return run_dir
 
 

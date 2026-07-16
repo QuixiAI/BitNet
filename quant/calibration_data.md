@@ -479,6 +479,9 @@ After the smoke run succeeds, a strong correctness-first command is:
   --revision <MODEL_COMMIT> \
   --output runs/Llama-3.2-1B-Instruct-TQ1-V12-cal512 \
   --profile tq1_v12-j-r \
+  --quantize-tied-embedding-head \
+  --shared-head-importance 0.75 \
+  --shared-embedding-importance 0.25 \
   --importance-mode diagonal \
   --weight-metric iq1 \
   --calibration-file data/calibration.jsonl \
@@ -510,6 +513,10 @@ Notes:
 - If MPS memory is insufficient, reduce `--calibration-seq-len` only after
   checking which workload bucket will be lost, or use `--device cpu` for both
   collection and projection. Do not silently change the distribution.
+- `--quantize-tied-embedding-head` hooks the output head's final-hidden input and
+  stores a vocabulary-length token-frequency tensor. Both are required to
+  project the tied matrix once for its lookup and output-logit consumers. The
+  raw-sum merger verifies compatible frequency inventories and adds counts.
 
 ## 9. Prove that the set is good
 
@@ -593,6 +600,64 @@ inside a single average.
 - Rendering with a different tokenizer, model revision, or chat template.
 - Optimizing only aggregate error instead of held-out end-to-end quality.
 - Committing private production logs or losing license and source provenance.
+
+## 11. KV-cache-specific calibration
+
+KV Q4 uses the same representative-corpus principles, but it needs more long
+contexts and generation prefixes than a weight-only second-moment run. Build a
+tracked extension of the primary corpus rather than an unrelated synthetic set:
+
+- preserve the deployed prompt and chat template;
+- include own-model continuations so later generation positions are observed;
+- include off-policy documents and conversations at each intended context tier;
+- balance by retained tokens and position ranges, not record count;
+- record context lengths, record/token counts, source hashes, and truncation;
+- keep the quality/evaluation prompts disjoint.
+
+Instrument the exact attention implementation and choose one collection point:
+`pre_rope` or `post_rope`. Never combine them. Save captured key tensors as
+safetensors with exact names `layer.0.key` through `layer.<L-1>.key`, each in
+explicit `[batch, kv_head, token, channel]` layout. An optional shared
+`token_mask` is boolean `[batch, token]`. All layers must cover the same tokens.
+The capture job's own manifest should identify the hook location, attention
+implementation, source/model/tokenizer revisions, and input file hashes.
+
+Build the separately linked channel-mean artifact with:
+
+```bash
+.venv/bin/python quant/calibrate_kv.py \
+  --captured-keys runs/kv/captured_keys.safetensors \
+  --output runs/kv/key_channel_mean.safetensors \
+  --model-artifact-sha256 <CANONICAL_MODEL_ARTIFACT_SHA256> \
+  --model-id unsloth/Llama-3.2-1B-Instruct \
+  --model-revision <MODEL_COMMIT> \
+  --tokenizer-id unsloth/Llama-3.2-1B-Instruct \
+  --tokenizer-revision <TOKENIZER_COMMIT> \
+  --layer-count 16 \
+  --num-kv-heads 8 \
+  --head-dim 64 \
+  --kv-dtype float16 \
+  --rotation-state post_rope \
+  --attention-implementation sdpa \
+  --context-length 1024 \
+  --context-length 4096 \
+  --context-length 16384 \
+  --record-count <RECORDS> \
+  --source-sha256 <CAPTURE_MANIFEST_SHA256>
+```
+
+Use the dimensions and dtype from the exact model configuration/capture; the
+values above are an example and are validated, not inferred. The output's
+companion manifest hashes the mean artifact and links it to the model artifact.
+Runtime loading supplies the expected model/layer/head/dtype/RoPE/attention
+identity and rejects any mismatch.
+
+Evaluate FP16, Q8, centered Q4, and uncentered-Q4 ablation on the same model.
+For each, measure forward-KL mean/p50/p95/p99 against that model's own FP16 cache
+on both own generations and off-policy long contexts, plus downstream scores,
+several context lengths, cache bytes, and latency p20/median/p80. Q4 is promoted
+as a memory option only if those results pass; reduced bytes alone do not imply
+speed or acceptable quality.
 
 ## Recommended final checklist
 

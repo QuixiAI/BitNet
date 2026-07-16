@@ -17,7 +17,8 @@ import yaml
 from .artifact import ArtifactReader
 from .codebook import CodebookRegistry, load_iq1_reference, sign_canonical_codebook
 from .pipeline import (
-    LLAMA_KEEP_FP_REGEXES, LLAMA_TARGET_REGEXES, bake_debug_checkpoint,
+    LLAMA_KEEP_FP_REGEXES, LLAMA_SHARED_EMBEDDING_REGEX, LLAMA_TARGET_REGEXES,
+    bake_debug_checkpoint,
     classify_model_linears, collect_statistics, learn_model_codebook,
     load_statistics, run_full_model_ptq, save_model_source_files)
 from .solver import PatternCorpus, build_joint_codebook, build_product_codebook, canonical_shapes
@@ -115,6 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-diagonal-fallback", action="store_true")
     parser.add_argument("--target-regex", action="append", default=None)
     parser.add_argument("--keep-fp-regex", action="append", default=None)
+    parser.add_argument("--quantize-tied-embedding-head", action="store_true",
+                        help="project model.embed_tokens once and share it with lm_head")
+    parser.add_argument("--shared-head-importance", type=float, default=0.75)
+    parser.add_argument("--shared-embedding-importance", type=float, default=0.25)
 
     parser.add_argument("--codebook-source", default="learned",
                         choices=["learned", "universal", "iq1", "artifact"])
@@ -188,9 +193,13 @@ def _placeholder_book(index_format: str):
 
 
 def _build_spec(args, book) -> QuantSpec:
+    target_regexes = tuple(args.target_regex or LLAMA_TARGET_REGEXES)
+    if args.quantize_tied_embedding_head \
+            and LLAMA_SHARED_EMBEDDING_REGEX not in target_regexes:
+        target_regexes += (LLAMA_SHARED_EMBEDDING_REGEX,)
     spec = QuantSpec.core(
         default_profile=args.profile, codebook=book.ref(),
-        target_regexes=tuple(args.target_regex or LLAMA_TARGET_REGEXES),
+        target_regexes=target_regexes,
         keep_fp_regexes=tuple(args.keep_fp_regex or LLAMA_KEEP_FP_REGEXES),
         activation_mode=args.activation_mode, importance_mode=args.importance_mode)
     return replace(
@@ -198,7 +207,10 @@ def _build_spec(args, book) -> QuantSpec:
         weight_metric=args.weight_metric, candidate_count=args.candidate_count,
         assignment_mode=args.assignment_mode,
         alternating_iterations=args.alternating_iterations,
-        gptq_feedback=args.gptq_feedback, gptq_damping=args.gptq_damping)
+        gptq_feedback=args.gptq_feedback, gptq_damping=args.gptq_damping,
+        shared_embedding_head=args.quantize_tied_embedding_head,
+        shared_head_importance=args.shared_head_importance,
+        shared_embedding_importance=args.shared_embedding_importance)
 
 
 def _load_model(args, revision: str):
@@ -256,9 +268,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             temporary = QuantSpec.core(
                 default_profile=f"tq1_{_format(args.profile)}-j-r",
                 codebook=placeholder.ref(),
-                target_regexes=tuple(args.target_regex or LLAMA_TARGET_REGEXES),
+                target_regexes=(tuple(args.target_regex or LLAMA_TARGET_REGEXES)
+                                + ((LLAMA_SHARED_EMBEDDING_REGEX,)
+                                   if args.quantize_tied_embedding_head
+                                   and LLAMA_SHARED_EMBEDDING_REGEX not in tuple(
+                                       args.target_regex or LLAMA_TARGET_REGEXES)
+                                   else ())),
                 keep_fp_regexes=tuple(args.keep_fp_regex or LLAMA_KEEP_FP_REGEXES),
                 activation_mode=args.activation_mode, importance_mode="uniform")
+            temporary = replace(
+                temporary,
+                shared_embedding_head=args.quantize_tied_embedding_head,
+                shared_head_importance=args.shared_head_importance,
+                shared_embedding_importance=args.shared_embedding_importance)
             inventory = classify_model_linears(model, temporary)
             if args.codebook_source == "universal":
                 if _encoding(args.profile) == "product":
@@ -285,7 +307,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         spec = _build_spec(args, book)
 
     inventory = classify_model_linears(model, spec)
-    print(f"[inventory] {len(inventory.target)} TQ1, {len(inventory.keep_fp)} FP linears")
+    print(f"[inventory] {len(inventory.target)} TQ1 linears, "
+          f"{len(inventory.shared_tied)} shared tensors, {len(inventory.keep_fp)} FP linears")
     statistics_path = args.statistics_artifact
     if statistics_path is None and spec.importance_mode != "uniform":
         if not args.calibration_file:
@@ -313,7 +336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if device.type == "mps":
             torch.mps.empty_cache()
     statistics, statistics_meta, statistics_hash = load_statistics(statistics_path, spec)
-    expected_stats = set(inventory.target)
+    expected_stats = set(inventory.statistics_targets())
     recorded_stats = set(statistics_meta.get("target_modules", expected_stats))
     if statistics_path and recorded_stats != expected_stats:
         raise ValueError("calibration artifact target inventory differs from the model")

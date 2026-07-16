@@ -18,16 +18,24 @@ quant:
   default_codebook_id: llama32_v12j
   activation_mode: a8_token
   importance_stats: runs/llama32-1b-instruct.calibration.safetensors
+  # One latent/payload serves token lookup and output logits. The statistics
+  # artifact must include final-hidden sensitivity and token frequencies.
+  shared_embedding_head: true
+  shared_head_importance: 0.75
+  shared_embedding_importance: 0.25
   qat_projection: soft
   candidate_count: 32
   top_m: 8
   assignment_chunk: 2048
   temperature_start: 1.0
   temperature_end: 0.05
-  soft_steps: 1000
-  hard_steps: 4000
-  freeze_indices_at: 5000
-  freeze_max_step: 9000
+  # Token-domain schedule. Every boundary is aligned for 1/2/4-process runs at
+  # the canonical 131,072 tokens/process-step and fits inside the 200M budget.
+  soft_tokens: 33554432
+  hard_tokens: 134217728
+  freeze_eval_every_tokens: 16777216
+  freeze_indices_at_tokens: 167772160
+  freeze_max_tokens: 184549376
   freeze_flip_threshold: 0.0001
   freeze_margin_threshold: 0.0
   freeze_sustain_evals: 3

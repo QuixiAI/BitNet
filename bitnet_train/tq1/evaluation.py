@@ -15,6 +15,8 @@ import torch.nn.functional as F
 
 
 QUALITY_REPORT_SCHEMA = 1
+CAPABILITY_SUITE_SCHEMA = 1
+CAPABILITY_REPORT_SCHEMA = 1
 REQUIRED_CORE_BASELINES = (
     "dense_teacher",
     "lossless_ternary",
@@ -31,6 +33,272 @@ REQUIRED_METRICS = {
     "teacher_kl_p50", "teacher_kl_p95", "teacher_kl_p99",
     "top_token_agreement",
 }
+
+REQUIRED_CAPABILITY_TASKS = {
+    "mmlu_redux": "knowledge",
+    "musr": "reasoning",
+    "gsm8k": "math",
+    "math_500": "math",
+    "humaneval_plus": "code",
+    "mbpp_plus": "code",
+    "ifeval": "instruction",
+    "ifbench": "instruction",
+    "bfcl_v3_single_turn": "tools",
+    "bfcl_v3_multi_turn": "tools",
+    "long_context_4k": "long_context",
+    "long_context_16k": "long_context",
+    "long_context_32k": "long_context",
+}
+CAPABILITY_MODES = {"w_only", "w_a8"}
+TASK_SCORERS = {
+    "mmlu_redux": {"multiple_choice"},
+    "musr": {"multiple_choice", "exact"},
+    "gsm8k": {"numeric"},
+    "math_500": {"numeric"},
+    "humaneval_plus": {"code_execution"},
+    "mbpp_plus": {"code_execution"},
+    "ifeval": {"constraint_fraction"},
+    "ifbench": {"constraint_fraction"},
+    "bfcl_v3_single_turn": {"bfcl_ast", "tool_execution"},
+    "bfcl_v3_multi_turn": {"bfcl_ast", "tool_execution"},
+    "long_context_4k": {"retrieval_exact", "exact"},
+    "long_context_16k": {"retrieval_exact", "exact"},
+    "long_context_32k": {"retrieval_exact", "exact"},
+}
+
+
+def _sha256(value: Any, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 \
+            or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{name} must be a full lowercase SHA-256")
+    return value
+
+
+def _immutable_revision(value: Any, name: str) -> str:
+    if not isinstance(value, str) or len(value) not in {40, 64} \
+            or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{name} must be a full immutable 40/64-hex revision")
+    return value
+
+
+def canonical_document_sha256(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False).encode()).hexdigest()
+
+
+def validate_capability_suite(suite: Mapping[str, Any]) -> None:
+    """Validate the immutable benchmark/scorer identity used by QI-3."""
+    required = {"schema", "name", "tasks", "aggregate_method"}
+    if not isinstance(suite, Mapping) or set(suite) != required:
+        raise ValueError("capability suite has an invalid top-level schema")
+    if suite["schema"] != CAPABILITY_SUITE_SCHEMA:
+        raise ValueError("unsupported capability suite schema")
+    if not isinstance(suite["name"], str) or not suite["name"]:
+        raise ValueError("capability suite name must be nonempty")
+    if suite["aggregate_method"] != "macro_mean_task_normalized_score":
+        raise ValueError("capability suite aggregate method is not pinned")
+    tasks = suite["tasks"]
+    if not isinstance(tasks, list) or len(tasks) != len(REQUIRED_CAPABILITY_TASKS):
+        raise ValueError("capability suite task inventory is incomplete")
+    fields = {
+        "id", "capability", "dataset", "config", "revision", "split",
+        "prompt_template_sha256", "scorer", "scorer_version_sha256",
+        "execution_image_digest", "seed", "max_generation_tokens", "backend",
+        "deterministic", "context_length",
+    }
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for index, task in enumerate(tasks):
+        if not isinstance(task, Mapping) or set(task) != fields:
+            raise ValueError(f"capability suite task {index} has an invalid schema")
+        identity = task["id"]
+        if identity in by_id or identity not in REQUIRED_CAPABILITY_TASKS:
+            raise ValueError(f"capability suite has unknown/duplicate task {identity!r}")
+        if task["capability"] != REQUIRED_CAPABILITY_TASKS[identity]:
+            raise ValueError(f"{identity}: capability mismatch")
+        for key in ("dataset", "revision", "split", "scorer", "backend"):
+            if not isinstance(task[key], str) or not task[key]:
+                raise ValueError(f"{identity}.{key} must be nonempty")
+        _immutable_revision(task["revision"], f"{identity}.revision")
+        if task["scorer"] not in TASK_SCORERS[identity]:
+            raise ValueError(f"{identity}: scorer is not task-appropriate")
+        if task["config"] is not None and not isinstance(task["config"], str):
+            raise ValueError(f"{identity}.config must be a string or null")
+        _sha256(task["prompt_template_sha256"], f"{identity}.prompt_template_sha256")
+        _sha256(task["scorer_version_sha256"], f"{identity}.scorer_version_sha256")
+        image = task["execution_image_digest"]
+        if task["capability"] in {"code", "tools"}:
+            if not isinstance(image, str) or not image.startswith("sha256:"):
+                raise ValueError(f"{identity}: code/tool execution image must be pinned")
+            _sha256(image[7:], f"{identity}.execution_image_digest")
+        elif image is not None:
+            raise ValueError(f"{identity}: execution image must be null")
+        if isinstance(task["seed"], bool) or not isinstance(task["seed"], int):
+            raise ValueError(f"{identity}.seed must be an integer")
+        if isinstance(task["max_generation_tokens"], bool) \
+                or not isinstance(task["max_generation_tokens"], int) \
+                or task["max_generation_tokens"] < 1:
+            raise ValueError(f"{identity}.max_generation_tokens must be positive")
+        if task["deterministic"] is not True:
+            raise ValueError(f"{identity}: deterministic execution is required")
+        expected_context = ({"long_context_4k": 4096, "long_context_16k": 16384,
+                             "long_context_32k": 32768}.get(identity))
+        if task["context_length"] != expected_context:
+            raise ValueError(f"{identity}: context length is not pinned correctly")
+        by_id[identity] = task
+    if set(by_id) != set(REQUIRED_CAPABILITY_TASKS):
+        raise ValueError("capability suite is missing required tasks")
+
+
+def _validate_task_scores(scores: Mapping[str, Any], *, prefix: str) -> None:
+    if not isinstance(scores, Mapping) or set(scores) != set(REQUIRED_CAPABILITY_TASKS):
+        raise ValueError(f"{prefix} task result inventory is incomplete")
+    fields = {"score", "sample_count", "deterministic_parse_failures",
+              "llm_fallback_count", "output_sha256"}
+    for task, result in scores.items():
+        if not isinstance(result, Mapping) or set(result) != fields:
+            raise ValueError(f"{prefix}.{task} has an invalid schema")
+        score = _finite_number(result["score"], f"{prefix}.{task}.score")
+        if not 0 <= score <= 1:
+            raise ValueError(f"{prefix}.{task}.score must be in [0,1]")
+        count = result["sample_count"]
+        failures = result["deterministic_parse_failures"]
+        fallbacks = result["llm_fallback_count"]
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in (count, failures, fallbacks)) or count < 1:
+            raise ValueError(f"{prefix}.{task} counts are invalid")
+        if fallbacks > failures or failures > count:
+            raise ValueError(f"{prefix}.{task} fallback counts are inconsistent")
+        _sha256(result["output_sha256"], f"{prefix}.{task}.output_sha256")
+
+
+def _task_macro(scores: Mapping[str, Mapping[str, Any]]) -> float:
+    return sum(float(scores[name]["score"]) for name in scores) / len(scores)
+
+
+def _capability_macros(scores: Mapping[str, Mapping[str, Any]]) -> dict[str, float]:
+    grouped: dict[str, list[float]] = defaultdict(list)
+    for task, capability in REQUIRED_CAPABILITY_TASKS.items():
+        grouped[capability].append(float(scores[task]["score"]))
+    return {name: sum(values) / len(values) for name, values in sorted(grouped.items())}
+
+
+def validate_capability_report(report: Mapping[str, Any], suite: Mapping[str, Any],
+                               *, quant_spec_sha256: str) -> dict[str, Any]:
+    """Fail closed and recompute all QI-3 gates from raw task scores."""
+    validate_capability_suite(suite)
+    fields = {
+        "schema", "suite_sha256", "quant_spec_sha256", "dense_result_sha256",
+        "evaluation_data_sha256", "predeclared_gates", "dense", "modes",
+        "teacher_kl", "stratified", "rerun", "commands", "provenance",
+    }
+    if not isinstance(report, Mapping) or set(report) != fields:
+        raise ValueError("capability report has an invalid top-level schema")
+    if report["schema"] != CAPABILITY_REPORT_SCHEMA:
+        raise ValueError("unsupported capability report schema")
+    if report["suite_sha256"] != canonical_document_sha256(suite):
+        raise ValueError("capability report suite hash mismatch")
+    if report["quant_spec_sha256"] != quant_spec_sha256:
+        raise ValueError("capability report QuantSpec mismatch")
+    for key in ("dense_result_sha256", "evaluation_data_sha256"):
+        _sha256(report[key], key)
+    gates = report["predeclared_gates"]
+    gate_fields = {
+        "declared_before_candidate", "dense_result_sha256", "aggregate_retention",
+        "per_capability_retention", "maximum_task_regression", "teacher_kl_mean",
+        "teacher_kl_p95", "teacher_kl_p99", "rerun_max_score_delta",
+    }
+    if not isinstance(gates, Mapping) or set(gates) != gate_fields \
+            or gates["declared_before_candidate"] is not True \
+            or gates["dense_result_sha256"] != report["dense_result_sha256"]:
+        raise ValueError("capability gates were not predeclared against this dense result")
+    for key in gate_fields - {"declared_before_candidate", "dense_result_sha256"}:
+        value = _finite_number(gates[key], f"predeclared_gates.{key}")
+        if value < 0:
+            raise ValueError(f"predeclared_gates.{key} must be nonnegative")
+    dense = report["dense"]
+    if not isinstance(dense, Mapping) or set(dense) != {"tasks"}:
+        raise ValueError("dense capability results have an invalid schema")
+    _validate_task_scores(dense["tasks"], prefix="dense.tasks")
+    modes = report["modes"]
+    if not isinstance(modes, Mapping) or set(modes) != CAPABILITY_MODES:
+        raise ValueError("capability report must name W-only and W+A8 separately")
+    for mode, value in modes.items():
+        if not isinstance(value, Mapping) or set(value) != {"tasks"}:
+            raise ValueError(f"{mode} results have an invalid schema")
+        _validate_task_scores(value["tasks"], prefix=f"modes.{mode}.tasks")
+    kl = report["teacher_kl"]
+    if not isinstance(kl, Mapping) or set(kl) != CAPABILITY_MODES:
+        raise ValueError("teacher KL must be reported for both quantization modes")
+    for mode, values in kl.items():
+        if not isinstance(values, Mapping) or set(values) != {"mean", "p50", "p95", "p99"}:
+            raise ValueError(f"teacher_kl.{mode} has an invalid schema")
+        numbers = [_finite_number(values[key], f"teacher_kl.{mode}.{key}")
+                   for key in ("mean", "p50", "p95", "p99")]
+        if min(numbers) < -1e-6 or not numbers[1] <= numbers[2] <= numbers[3]:
+            raise ValueError(f"teacher_kl.{mode} is invalid")
+    stratified = report["stratified"]
+    if not isinstance(stratified, Mapping) or set(stratified) != CAPABILITY_MODES:
+        raise ValueError("stratified evidence must cover both modes")
+    for mode, dimensions in stratified.items():
+        if not isinstance(dimensions, Mapping) or set(dimensions) != {"length", "language"}:
+            raise ValueError(f"stratified.{mode} must contain length and language")
+        for dimension, buckets in dimensions.items():
+            if not isinstance(buckets, Mapping) or not buckets:
+                raise ValueError(f"stratified.{mode}.{dimension} must be nonempty")
+            for bucket, score in buckets.items():
+                if not isinstance(bucket, str) or not bucket or not 0 <= _finite_number(
+                        score, f"stratified.{mode}.{dimension}.{bucket}") <= 1:
+                    raise ValueError("invalid stratified score")
+    rerun = report["rerun"]
+    if not isinstance(rerun, Mapping) or set(rerun) != CAPABILITY_MODES:
+        raise ValueError("exact rerun evidence must cover both modes")
+    decisions: dict[str, Any] = {}
+    dense_tasks = dense["tasks"]
+    dense_aggregate = _task_macro(dense_tasks)
+    dense_caps = _capability_macros(dense_tasks)
+    def retention(candidate: float, reference: float) -> float:
+        return 1.0 if reference == 0 and candidate == 0 else candidate / max(reference, 1e-12)
+    for mode, value in modes.items():
+        tasks = value["tasks"]
+        repeated = rerun[mode]
+        if not isinstance(repeated, Mapping) or set(repeated) != {
+                "score_delta", "first_output_sha256", "second_output_sha256"}:
+            raise ValueError(f"rerun.{mode} has an invalid schema")
+        delta = _finite_number(repeated["score_delta"], f"rerun.{mode}.score_delta")
+        if delta < 0:
+            raise ValueError(f"rerun.{mode}.score_delta must be nonnegative")
+        _sha256(repeated["first_output_sha256"], f"rerun.{mode}.first_output_sha256")
+        _sha256(repeated["second_output_sha256"], f"rerun.{mode}.second_output_sha256")
+        aggregate = _task_macro(tasks)
+        caps = _capability_macros(tasks)
+        task_regression = max(float(dense_tasks[name]["score"])
+                              - float(tasks[name]["score"]) for name in tasks)
+        checks = {
+            "aggregate_retention": retention(aggregate, dense_aggregate)
+                >= float(gates["aggregate_retention"]),
+            "per_capability_retention": all(
+                retention(caps[name], dense_caps[name])
+                >= float(gates["per_capability_retention"]) for name in caps),
+            "maximum_task_regression": task_regression
+                <= float(gates["maximum_task_regression"]),
+            "teacher_kl_mean": float(kl[mode]["mean"]) <= float(gates["teacher_kl_mean"]),
+            "teacher_kl_p95": float(kl[mode]["p95"]) <= float(gates["teacher_kl_p95"]),
+            "teacher_kl_p99": float(kl[mode]["p99"]) <= float(gates["teacher_kl_p99"]),
+            "rerun_stability": delta <= float(gates["rerun_max_score_delta"]),
+        }
+        decisions[mode] = {
+            "passed": all(checks.values()), "checks": checks,
+            "aggregate_score": aggregate,
+            "aggregate_retention": retention(aggregate, dense_aggregate),
+            "capability_scores": caps, "maximum_task_regression": task_regression,
+        }
+    if not isinstance(report["commands"], list) or not report["commands"] \
+            or not all(isinstance(item, str) and item for item in report["commands"]):
+        raise ValueError("capability report commands must be nonempty")
+    if not isinstance(report["provenance"], Mapping) or not report["provenance"]:
+        raise ValueError("capability report provenance must be nonempty")
+    return decisions
 
 
 def file_sha256(path: str | Path) -> str:

@@ -91,6 +91,92 @@ dispatch path. It is not a competitive prefill GEMM: dense dequantized BLAS is
 3.36–58.45× faster when the expanded dense matrix is resident. A future prefill
 candidate must tile/reuse decoded weights across M instead of looping GEMV.
 
+**2026-07-15 QI-5 cached-repack routing pass — budgeted dense prefill KEPT;
+eager/unbudgeted and sub-128 first-use routing REJECTED.** The hypothesis was
+that repeated packed GEMV is decode-appropriate but fails to reuse decoded
+weights across prompt tokens. The candidate lazily creates the exact,
+deterministically hashed `tq1_dense_f32_row_major_v1` private layout, quantizes
+activations with the same A8-token contract, and uses Accelerate-backed F32
+BLAS. Canonical payload and expanded-codebook state remain resident. A zero-byte
+policy budget keeps the route disabled; an enabled route must account for the
+entire dense tensor.
+
+Device/toolchain: Apple M4 Max (16 CPU cores, 128 GB), macOS 26.5.2 build
+25F84, LLVM clang 22.1.0, Python 3.12.9, PyTorch
+2.14.0.dev20260706, 12 Torch threads, git label `fed90f2-dirty`. Command:
+
+```bash
+.venv/bin/python bitnet_train/perf/bench_tq1_runtime_routes.py \
+  --warmups 10 --iterations 30 --include-head
+```
+
+Coverage is V11-J-R and V12-J-R with FP16 row scales and A8-token activations;
+all four distinct Llama-3.2-1B projection shapes, ragged `N=513`, M=32/64/128,
+plus the real tied output head `M=1,N=128256,K=2048`. The scalar packed oracle
+is retained. Packed-native output was bit-identical to it. The dense candidate
+passes combined FP32 `atol=2e-5, rtol=2e-5`; observed maximum absolute/relative
+errors were `1.0872e-4 / 3.4973e-6` (the absolute maximum occurs on
+`K=8192` and passes the combined bound). The complete 31-row run, hashes,
+repack time/bytes, CV, and raw p20/p80 are in
+`perf/results/2026-07-15/tq1-runtime-routes/run.json` (git-ignored).
+
+The following is the conservative first-use decision set at M=128. “Hot” omits
+the separately reported one-time repack; “first-use” includes repack plus the
+hot median. Times are p20/median/p80 milliseconds:
+
+| profile / N×K | packed M128 ms | dense hot M128 ms | hot speedup | repack ms / MiB | first-use speedup |
+|---|---:|---:|---:|---:|---:|
+| V11 / 512×2048 | 12.673/12.813/12.898 | 0.754/0.774/0.782 | 16.54× | 4.67 / 4.0 | 2.35× |
+| V11 / 2048×2048 | 49.270/49.483/49.635 | 1.113/1.140/1.159 | 43.42× | 10.16 / 16.0 | 4.38× |
+| V11 / 8192×2048 | 194.105/194.720/195.112 | 2.234/2.253/2.280 | 86.43× | 37.29 / 64.0 | 4.92× |
+| V11 / 2048×8192 | 189.147/189.777/190.675 | 2.629/2.669/2.797 | 71.11× | 39.12 / 64.0 | 4.54× |
+| V11 / 513×2048 | 12.796/12.897/12.978 | 0.883/0.893/0.907 | 14.44× | 4.70 / 4.0 | 2.31× |
+| V12 / 512×2048 | 12.881/12.934/13.044 | 0.879/0.892/0.914 | 14.50× | 6.32 / 4.0 | 1.79× |
+| V12 / 2048×2048 | 49.187/49.308/49.471 | 1.255/1.278/1.292 | 38.58× | 11.79 / 16.0 | 3.77× |
+| V12 / 8192×2048 | 195.200/196.010/196.590 | 2.333/2.356/2.371 | 83.20× | 40.76 / 64.0 | 4.55× |
+| V12 / 2048×8192 | 189.876/190.678/190.997 | 2.632/2.680/2.865 | 71.16× | 40.48 / 64.0 | 4.42× |
+| V12 / 513×2048 | 12.901/12.945/12.999 | 0.884/0.897/0.912 | 14.44× | 6.38 / 4.0 | 1.78× |
+
+M=32 first-use speedups ranged from 0.51–1.20× and M=64 from 0.93–2.48×,
+so neither threshold is safe across supported edge shapes. M=128 was
+1.78–4.92× across every profile/shape, including `N=513`; keep the default
+opt-in short-prefill threshold at 128. The long-prefill threshold is separately
+named (512 by default) but currently selects the same cached-BLAS implementation.
+The widest candidate had a few OS outliers (CV 0.354) while its p20/p80 remained
+tight around the median; no conclusion uses mean timing.
+
+The tied output-head hot path was 4.3307/4.3818/4.4075 ms versus packed native
+23.8957/24.0240/24.0936 ms, a 5.48× hot speedup with `1.91e-6 / 1.25e-7`
+maximum absolute/relative error. Its one-time repack is 550.3 ms and 1,050,673,152
+bytes (1002 MiB), so first-token latency is a 0.043× regression; the measured
+kernel break-even is about 29 decode tokens. Keep this only behind the explicit
+`output_head_dense_decode` and byte-budget policy. Reject enabling it by default
+until full-model `tg128`, TTFT, resident/peak memory, thermal, and joules/token
+evidence passes the separate QI-5 report contract. This is a kernel-route win,
+not yet a model-throughput or energy claim.
+
+The QI-2 embedding-gather coverage follow-up used the same device/toolchain and
+real V12-J-R vocabulary matrix:
+
+```bash
+.venv/bin/python bitnet_train/perf/bench_tq1_runtime_routes.py \
+  --head-only --warmups 10 --iterations 30 \
+  --output bitnet_train/perf/results/2026-07-15/tq1-embedding-head-routes/run.json
+```
+
+Packed lookup matched the unique-row scalar oracle exactly (`atol=rtol=0`) for
+32 repeated copies of one token, a 128-token/16-unique prompt, a
+512-token/256-unique prompt, and ragged `3x17` IDs including vocabulary row
+128255. Their p20/median/p80 times were respectively
+3.4231/3.4937/3.5699, 3.5774/3.6291/3.6654,
+4.3920/4.4440/4.4725, and 3.7185/3.7731/3.8322 ms. Keep the packed
+unique-row gather and the new harness coverage; no embedding speedup is claimed
+because this pass establishes correctness/shape behavior rather than an
+alternative gather kernel. In the same rerun the optional dense head remained a
+5.44x hot win (23.6384 vs 4.3449 ms median) with 1.91e-6/1.31e-7 maximum
+absolute/relative error, a 546.1 ms repack, and the unchanged 1,050,673,152-byte
+residency cost.
+
 **2026-07-15 pinned llama.cpp scalar integration — KEPT as the permanent
 reference; speed claim REJECTED.** The hypothesis was that direct packed decode
 would save weight traffic but remain codebook-gather/loop bound, especially for

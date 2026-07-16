@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -199,7 +201,7 @@ def test_schema2_artifact_round_trip(tmp_path):
     )
     source_files = tmp_path / "source_files"
     source_files.mkdir()
-    (source_files / "config.json").write_text("{}")
+    (source_files / "config.json").write_text('{"tie_word_embeddings": true}')
     (source_files / "tokenizer_config.json").write_text("{}")
     indices = torch.zeros((2, 32), dtype=torch.int64)
     payload = pack_payload(indices, "tq1_v11-j-r")
@@ -210,12 +212,70 @@ def test_schema2_artifact_round_trip(tmp_path):
         codebook_id=book.id, row_scales=torch.tensor([0.0, 0.5], dtype=torch.float16),
     )
     builder.add_non_tq1("model.norm.weight", torch.ones(2, dtype=torch.float16))
+    tied = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    builder.add_non_tq1("model.embed_tokens.weight", tied)
+    builder.add_non_tq1("lm_head.weight", tied)
+    with pytest.raises(ValueError, match="exact shared storage"):
+        builder.add_alias("equal_but_untied.weight", "model.embed_tokens.weight",
+                          tied.clone())
+    with pytest.raises(ValueError, match="identical dtype"):
+        builder.add_non_tq1("incompatible_tie.weight", tied, dtype=torch.float16)
     out = builder.write(tmp_path / "artifact", source_files=source_files,
                         quantization_report={"ok": True})
     reader = ArtifactReader(out)
     reader.validate()
     assert reader.quant_spec.sha256() == spec.sha256()
     assert reader.manifest["tensors"][0]["payload_key"].endswith(".__tq1_payload")
+    assert reader.aliases == {
+        "lm_head.weight": {
+            "target": "model.embed_tokens.weight", "shape": [4, 2],
+            "dtype": "float32", "kind": "parameter"}}
+    restored = reader.non_tq1_state_dict()
+    assert restored["lm_head.weight"] is restored["model.embed_tokens.weight"]
+    sizes = reader.manifest["size_accounting"]
+    assert sizes["unique_logical_parameters"] == 512 + 2 + 8
+    assert sizes["logical_parameter_references"] == 512 + 2 + 8 + 8
+    assert sizes["non_tq1_physical_bytes"] == 2 * 2 + 8 * 4
+    assert sizes["non_tq1_logical_reference_bytes"] == 2 * 2 + 2 * 8 * 4
+    assert sizes["canonical_artifact_bytes"] == sum(
+        path.stat().st_size for path in out.iterdir() if path.is_file())
+
+    corruptions = {
+        "hash": lambda manifest: manifest.__setitem__("tensor_aliases_sha256", "0" * 64),
+        "missing": lambda manifest: manifest["tensor_aliases"]["lm_head.weight"].__setitem__(
+            "target", "missing.weight"),
+        "shape": lambda manifest: manifest["tensor_aliases"]["lm_head.weight"].__setitem__(
+            "shape", [8, 1]),
+        "dtype": lambda manifest: manifest["tensor_aliases"]["lm_head.weight"].__setitem__(
+            "dtype", "float16"),
+    }
+    for label, mutate in corruptions.items():
+        broken = tmp_path / f"broken-{label}"
+        shutil.copytree(out, broken)
+        manifest_path = broken / "tq1_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        mutate(manifest)
+        if label != "hash":
+            manifest["tensor_aliases_sha256"] = hashlib.sha256(
+                canonical_json(manifest["tensor_aliases"]).encode()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        with pytest.raises(ValueError, match="alias"):
+            ArtifactReader(broken).validate()
+
+    cyclic = tmp_path / "broken-cycle"
+    shutil.copytree(out, cyclic)
+    manifest_path = cyclic / "tq1_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    alias = manifest["tensor_aliases"]["lm_head.weight"]
+    manifest["tensor_aliases"] = {
+        "lm_head.weight": {**alias, "target": "other.weight"},
+        "other.weight": {**alias, "target": "lm_head.weight"},
+    }
+    manifest["tensor_aliases_sha256"] = hashlib.sha256(
+        canonical_json(manifest["tensor_aliases"]).encode()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(ValueError, match="cycle"):
+        ArtifactReader(cyclic).validate()
 
 
 def test_pinned_iq1_grid_has_normative_schema2_hash():

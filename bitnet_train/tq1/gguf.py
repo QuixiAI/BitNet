@@ -108,6 +108,25 @@ def _floating_overrides(reader: ArtifactReader) -> dict[str, tuple[str, str]]:
     }
 
 
+def _validate_tied_output_convention(reader: ArtifactReader,
+                                     tensor_names: set[str]) -> None:
+    aliases = reader.aliases
+    llama_tie = aliases.get("lm_head.weight")
+    if llama_tie is None:
+        if any(name == "model.embed_tokens.weight"
+               or alias["target"] in {"model.embed_tokens.weight", "lm_head.weight"}
+               for name, alias in aliases.items()):
+            raise ValueError(
+                "Llama GGUF aliases must canonicalize lm_head to token embeddings")
+        return
+    if llama_tie["target"] != "model.embed_tokens.weight":
+        raise ValueError("Llama GGUF export requires lm_head to alias token embeddings")
+    if "token_embd.weight" not in tensor_names or "output.weight" in tensor_names:
+        raise ValueError(
+            "GGUF does not preserve the Llama tied-output convention "
+            "(token_embd present, output omitted)")
+
+
 def _tensor_bytes(value: torch.Tensor) -> bytes:
     return value.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes(order="C")
 
@@ -147,6 +166,7 @@ def rewrite_base_gguf(artifact_dir: str | Path, base_gguf: str | Path,
     if base.metadata.get("general.architecture") != "llama":
         raise ValueError("TQ1 revision-1 exporter supports the primary Llama architecture")
     base_tensors = {item.name: item for item in base.tensors}
+    _validate_tied_output_convention(reader, set(base_tensors))
     target_names = {
         hf_to_gguf_name(item["state_dict_name"]): item
         for item in reader.manifest["tensors"]
@@ -160,9 +180,7 @@ def rewrite_base_gguf(artifact_dir: str | Path, base_gguf: str | Path,
     absent_float = set(floating) - set(base_tensors)
     if absent_float:
         raise ValueError(f"ordinary converter omitted floating overrides {sorted(absent_float)}")
-    from safetensors.torch import load_file
-    non_tq1 = load_file(
-        str(reader.directory / "non_tq1_model.safetensors"), device="cpu")
+    non_tq1 = reader.non_tq1_state_dict(include_aliases=False)
     records: list[TensorRecord] = []
     policy: dict[str, Any] = {}
     scale_records: list[TensorRecord] = []
@@ -278,6 +296,7 @@ def validate_tq1_gguf(artifact_dir: str | Path, gguf_path: str | Path) -> dict[s
         if gguf.metadata.get(key) != expected:
             raise ValueError(f"GGUF metadata mismatch for {key}")
     tensors = {item.name: item for item in gguf.tensors}
+    _validate_tied_output_convention(reader, set(tensors))
     policy = json.loads(gguf.metadata["tq1.tensor_policy_json"])
     expected_names = {hf_to_gguf_name(item["state_dict_name"])
                       for item in reader.manifest["tensors"]}
@@ -311,9 +330,7 @@ def validate_tq1_gguf(artifact_dir: str | Path, gguf_path: str | Path) -> dict[s
                 raise ValueError(f"{name}: unexpected row scale policy")
         elif scale_name not in tensors or tensors[scale_name].data != _tensor_bytes(scales):
             raise ValueError(f"{name}: row scale mismatch")
-    from safetensors.torch import load_file
-    non_tq1 = load_file(
-        str(reader.directory / "non_tq1_model.safetensors"), device="cpu")
+    non_tq1 = reader.non_tq1_state_dict(include_aliases=False)
     for name, (state_name, profile) in _floating_overrides(reader).items():
         expected_type = {"fp32": 0, "fp16": 1, "bf16": 30}[profile]
         if name not in tensors or tensors[name].tensor_type != expected_type:
@@ -325,9 +342,15 @@ def validate_tq1_gguf(artifact_dir: str | Path, gguf_path: str | Path) -> dict[s
         if record.name not in tensors or tensors[record.name].data != record.data:
             raise ValueError(f"GGUF codebook tensor mismatch for {record.name}")
     digest = hashlib.sha256(Path(gguf_path).read_bytes()).hexdigest()
+    final_bytes = Path(gguf_path).stat().st_size
     return {
         "ok": True,
         "gguf_sha256": digest,
+        "final_gguf_bytes": final_bytes,
+        "size_accounting": {
+            **reader.manifest["size_accounting"],
+            "final_gguf_bytes": final_bytes,
+        },
         "quant_spec_sha256": spec.sha256(),
         "target_tensors": len(expected_names),
         "tensor_count": len(tensors),

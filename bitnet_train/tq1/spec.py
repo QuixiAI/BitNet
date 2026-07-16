@@ -193,6 +193,9 @@ class QuantSpec:
     target_regexes: tuple[str, ...]
     keep_fp_regexes: tuple[str, ...]
     tensor_overrides: tuple[TensorRule, ...]
+    shared_embedding_head: bool = False
+    shared_head_importance: float = 0.75
+    shared_embedding_importance: float = 0.25
 
     def __post_init__(self) -> None:
         if self.spec_revision != SPEC_REVISION:
@@ -263,6 +266,16 @@ class QuantSpec:
                 if book is None:
                     raise ValueError(f"tensor rule references unknown codebook {rule.codebook_id!r}")
                 self._validate_profile_codebook(rule.profile, book)
+        if not isinstance(self.shared_embedding_head, bool):
+            raise ValueError("shared_embedding_head must be boolean")
+        for name, value in (("shared_head_importance", self.shared_head_importance),
+                            ("shared_embedding_importance",
+                             self.shared_embedding_importance)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if self.shared_embedding_head and self.shared_head_importance \
+                + self.shared_embedding_importance <= 0:
+            raise ValueError("shared embedding/head importance weights cannot both be zero")
 
     @staticmethod
     def _validate_profile_codebook(profile: str, book: CodebookRef) -> None:

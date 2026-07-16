@@ -235,7 +235,8 @@ def normalized_statistics(sums: ModuleSums, *, ridge_factor: float = 1e-5) \
 
 
 def save_calibration_artifact(path: str | Path, sums: Mapping[str, ModuleSums], *,
-                              metadata: Mapping[str, Any], ridge_factor: float = 1e-5) -> None:
+                              metadata: Mapping[str, Any], ridge_factor: float = 1e-5,
+                              extra_tensors: Mapping[str, torch.Tensor] | None = None) -> None:
     tensors: dict[str, torch.Tensor] = {}
     counts = {}
     for name, module_sums in sorted(sums.items()):
@@ -247,6 +248,13 @@ def save_calibration_artifact(path: str | Path, sums: Mapping[str, ModuleSums], 
         if module_sums.cov256_sum is not None:
             tensors[f"{name}.__raw_cov256_sum"] = module_sums.cov256_sum
         counts[name] = module_sums.token_count
+    for name, value in sorted((extra_tensors or {}).items()):
+        if name in tensors or not isinstance(name, str) or not name:
+            raise ValueError(f"invalid duplicate calibration extra tensor {name!r}")
+        value = value.detach().contiguous().cpu()
+        if value.is_floating_point() and not torch.isfinite(value).all():
+            raise ValueError(f"calibration extra tensor {name} is nonfinite")
+        tensors[name] = value
     meta = {
         "tq1_calibration_schema": "1",
         "metadata_json": json.dumps({**metadata,
@@ -333,6 +341,7 @@ def merge_calibration_artifacts(inputs: Sequence[str | Path], output: str | Path
     if destination.exists() and not overwrite:
         raise FileExistsError(destination)
     loaded = [load_calibration_sums(path) for path in paths]
+    raw_artifacts = [load_calibration_artifact(path)[0] for path in paths]
     sums, first_meta = loaded[0]
     sums = {name: ModuleSums(value.width, value.modes) for name, value in sums.items()}
     for name, value in loaded[0][0].items():
@@ -373,8 +382,32 @@ def merge_calibration_artifacts(inputs: Sequence[str | Path], output: str | Path
     if conflict:
         raise ValueError(f"merge metadata may not override identity fields {sorted(conflict)}")
     aggregate.update(supplied)
+    frequency_keys = {
+        key for key in raw_artifacts[0] if key.endswith(".token_frequency")
+    }
+    if any({key for key in tensors if key.endswith(".token_frequency")}
+           != frequency_keys for tensors in raw_artifacts[1:]):
+        raise ValueError("calibration token-frequency inventories differ")
+    extra_tensors: dict[str, torch.Tensor] = {}
+    for key in sorted(frequency_keys):
+        first = raw_artifacts[0][key]
+        if first.ndim != 1 or first.dtype not in {
+                torch.int32, torch.int64, torch.float32, torch.float64}:
+            raise ValueError(f"{key}: invalid token-frequency tensor")
+        total = torch.zeros_like(first, dtype=torch.int64)
+        for tensors in raw_artifacts:
+            value = tensors[key]
+            if value.shape != first.shape or value.dtype != first.dtype:
+                raise ValueError(f"{key}: incompatible token-frequency tensor")
+            if value.is_floating_point() and not torch.equal(value, value.round()):
+                raise ValueError(f"{key}: token frequencies must be integral")
+            if (value < 0).any():
+                raise ValueError(f"{key}: token frequencies must be nonnegative")
+            total += value.to(torch.int64)
+        extra_tensors[key] = total
     destination.parent.mkdir(parents=True, exist_ok=True)
     save_calibration_artifact(
         destination, sums, metadata=aggregate,
-        ridge_factor=float(first_meta.get("ridge_factor", 1e-5)))
+        ridge_factor=float(first_meta.get("ridge_factor", 1e-5)),
+        extra_tensors=extra_tensors)
     return destination

@@ -10,7 +10,10 @@ from bitnet_train.tq1.codebook import (
     base3_ids, load_iq1_reference, product_codebook, sign_canonical_codebook)
 from bitnet_train.tq1.oracle import linear_w2a8, quantize_activation
 from bitnet_train.tq1.packing import layout, pack_payload
-from bitnet_train.tq1.runtime import NativeCPUTQ1Linear
+from bitnet_train.tq1.runtime import (
+    DENSE_REPACK_LAYOUT_VERSION, NativeCPUTQ1Embedding, NativeCPUTQ1Linear,
+    NativeRoutingPolicy)
+from bitnet_train.tq1.oracle import dequantize_weight
 from bitnet_train.tq1.solver import canonical_shapes
 
 
@@ -124,6 +127,59 @@ def test_native_module_reports_deterministic_repack_and_preserves_payload():
     assert torch.equal(first.payload, payload)
     assert first.repack_report["repack_sha256"] == second.repack_report["repack_sha256"]
     assert first.repack_report["canonical_packed_remains_resident"] is True
+
+
+def test_versioned_dense_prefill_repack_is_exact_budgeted_and_routed():
+    _, _, _, payload, scales, book, _ = _case(
+        "tq1_v11-j-r", "a8_token")
+    required = payload.shape[0] * payload.shape[1] * 256 * 4
+    policy = NativeRoutingPolicy(
+        dense_repack_budget_bytes=required,
+        short_prefill_min_tokens=2, long_prefill_min_tokens=4)
+    module = NativeCPUTQ1Linear(
+        payload, "tq1_v11-j-r", book, row_scales=scales,
+        activation_mode="a8_token", state_dict_name="test.weight", impl="scalar",
+        routing_policy=policy)
+    x = torch.randn(5, payload.shape[1] * 256)
+    expected = linear_w2a8(
+        x, payload, "tq1_v11-j-r", book, row_scales=scales,
+        activation_mode="a8_token")
+    got = module(x)
+    torch.testing.assert_close(got, expected, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(
+        module.dense_prefill_weight,
+        dequantize_weight(payload, "tq1_v11-j-r", book, row_scales=scales),
+        atol=0, rtol=0)
+    assert module.repack_report["dense_layout_version"] == DENSE_REPACK_LAYOUT_VERSION
+    assert module.repack_report["dense_repack_bytes"] == required
+    assert module.repack_report["last_route"] == "dense_long_prefill"
+    assert module.repack_report["canonical_packed_remains_resident"] is True
+
+    denied = NativeCPUTQ1Linear(
+        payload, "tq1_v11-j-r", book, row_scales=scales,
+        activation_mode="a8_token", state_dict_name="test.weight", impl="scalar",
+        routing_policy=NativeRoutingPolicy(
+            dense_repack_budget_bytes=required - 1,
+            short_prefill_min_tokens=2, long_prefill_min_tokens=4))
+    denied(x)
+    assert denied.dense_prefill_weight is None
+    assert denied.repack_report["last_route"] == "packed_small_batch"
+
+
+def test_output_head_dense_decode_is_an_explicit_shared_repack_route():
+    expected, _, _, payload, scales, book, x = _case(
+        "tq1_v11-j-r", "a8_token")
+    required = payload.shape[0] * payload.shape[1] * 256 * 4
+    shared = NativeCPUTQ1Embedding(
+        payload, "tq1_v11-j-r", book, row_scales=scales,
+        activation_mode="a8_token", state_dict_name="embed.weight", impl="scalar",
+        routing_policy=NativeRoutingPolicy(
+            dense_repack_budget_bytes=required,
+            output_head_dense_decode=True))
+    got = shared.linear(x).numpy()[0]
+    np.testing.assert_allclose(got, expected, atol=2e-5, rtol=2e-5)
+    assert shared.repack_report["last_route"] == "dense_output_head_decode"
+    assert shared.repack_report["dense_repack_materialized"] is True
 
 
 @pytest.mark.parametrize(("profile", "activation_mode", "bf16_scale"), [

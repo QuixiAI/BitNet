@@ -30,7 +30,7 @@ def test_exact_gguf_rewrite_preserves_payload_scale_and_codebook(tmp_path):
         candidate_count=4)
     source_files = tmp_path / "source_files"
     source_files.mkdir()
-    (source_files / "config.json").write_text("{}")
+    (source_files / "config.json").write_text('{"tie_word_embeddings": true}')
     (source_files / "tokenizer_config.json").write_text("{}")
     artifact = tmp_path / "artifact"
     builder = ArtifactBuilder(
@@ -44,7 +44,9 @@ def test_exact_gguf_rewrite_preserves_payload_scale_and_codebook(tmp_path):
         module_path + ".weight", module_path, payload,
         logical_shape=(2, 256), profile="tq1_v11-j-r",
         codebook_id=book.id, row_scales=scales)
-    builder.add_non_tq1("lm_head.weight", torch.ones(2, 2))
+    tied = torch.ones(2, 2)
+    builder.add_non_tq1("model.embed_tokens.weight", tied)
+    builder.add_non_tq1("lm_head.weight", tied)
     builder.write(artifact, source_files=source_files, quantization_report={})
 
     metadata_values = {
@@ -61,13 +63,17 @@ def test_exact_gguf_rewrite_preserves_payload_scale_and_codebook(tmp_path):
     base_path = tmp_path / "base.gguf"
     write_rewritten_gguf(base, base_path, (
         TensorRecord("blk.0.attn_q.weight", (256, 2), 1, bytes(2 * 256 * 2)),
-        TensorRecord("output.weight", (2, 2), 1, bytes(2 * 2 * 2)),
+        TensorRecord("token_embd.weight", (2, 2), 1, bytes(2 * 2 * 2)),
     ), {})
     output = tmp_path / "tq1.gguf"
     report = rewrite_base_gguf(artifact, base_path, output)
     checked = validate_tq1_gguf(artifact, output)
+    assert checked["final_gguf_bytes"] == output.stat().st_size
+    assert checked["size_accounting"]["final_gguf_bytes"] == output.stat().st_size
     assert report["target_tensors"] == checked["target_tensors"] == 1
     assert checked["ok"] is True
+    written_names = {item.name for item in parse_gguf(output).tensors}
+    assert "token_embd.weight" in written_names and "output.weight" not in written_names
     rows, ok = tq1_tensor_parity(artifact, output)
     assert ok and len(rows) == 1 and rows[0].status == "exact"
 
@@ -77,6 +83,58 @@ def test_exact_gguf_rewrite_preserves_payload_scale_and_codebook(tmp_path):
     damaged.write_bytes(data)
     rows, ok = tq1_tensor_parity(artifact, damaged)
     assert not ok and rows[-1].status == "mismatch"
+
+
+def test_quantized_tied_embedding_head_exports_one_low_bit_gguf_tensor(tmp_path):
+    shapes = canonical_shapes()
+    book = sign_canonical_codebook("sharedgguf", "v11", torch.cat((
+        shapes[(shapes == 0).all(1)], shapes[~(shapes == 0).all(1)][:1023])))
+    spec = replace(QuantSpec.core(
+        default_profile="tq1_v11-j-r", codebook=book.ref(),
+        target_regexes=(r"model\.embed_tokens",), keep_fp_regexes=("lm_head",),
+        importance_mode="uniform"), candidate_count=4, shared_embedding_head=True)
+    source = tmp_path / "shared_source"
+    source.mkdir()
+    (source / "config.json").write_text('{"tie_word_embeddings": true}')
+    (source / "tokenizer_config.json").write_text("{}")
+    builder = ArtifactBuilder(
+        spec, CodebookRegistry({book.id: book}), source_model="tiny",
+        source_revision="a" * 40, tokenizer_sha256="b" * 64,
+        chat_template_sha256="c" * 64)
+    indices = torch.arange(32).reshape(1, 32).repeat(3, 1)
+    payload = pack_payload(indices, "tq1_v11-j-r")
+    scales = torch.tensor([0.5, 0.25, 0.125], dtype=torch.float16)
+    shared_weight = torch.ones(3, 256)
+    builder.add_quantized(
+        "model.embed_tokens.weight", "model.embed_tokens", payload,
+        logical_shape=(3, 256), profile="tq1_v11-j-r", codebook_id=book.id,
+        row_scales=scales, source_tensor=shared_weight,
+        consumer_kind="shared_embedding_head")
+    builder.add_alias("lm_head.weight", "model.embed_tokens.weight", shared_weight)
+    artifact = builder.write(
+        tmp_path / "shared_artifact", source_files=source, quantization_report={})
+
+    values = {"general.architecture": "llama", "general.alignment": 32,
+              "llama.attention.head_count": 1, "llama.attention.head_count_kv": 1}
+    raw = b"".join((
+        encode_metadata("general.architecture", "llama"),
+        encode_metadata("general.alignment", 32, UINT32),
+        encode_metadata("llama.attention.head_count", 1, UINT32),
+        encode_metadata("llama.attention.head_count_kv", 1, UINT32)))
+    base = ParsedGGUF(3, values, {}, raw, (), 32)
+    base_path = tmp_path / "shared_base.gguf"
+    write_rewritten_gguf(base, base_path, (
+        TensorRecord("token_embd.weight", (256, 3), 1, bytes(3 * 256 * 2)),), {})
+    output = tmp_path / "shared_tq1.gguf"
+    rewrite_base_gguf(artifact, base_path, output)
+    checked = validate_tq1_gguf(artifact, output)
+    assert checked["ok"] is True
+    written = {item.name: item for item in parse_gguf(output).tensors}
+    assert written["token_embd.weight"].tensor_type == 45
+    assert written["token_embd.weight"].data == payload.numpy().tobytes()
+    assert "output.weight" not in written
+    rows, ok = tq1_tensor_parity(artifact, output)
+    assert ok and [row.gguf_name for row in rows] == ["token_embd.weight"]
 
 
 def test_mixed_bf16_override_is_written_exactly_with_qk_permutation(tmp_path):

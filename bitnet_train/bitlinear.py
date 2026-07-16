@@ -251,7 +251,9 @@ def snapshot_codes(model: nn.Module) -> dict[str, torch.Tensor]:
         for name, mod in iter_tq1linears(model):
             with torch.no_grad():
                 mod.projection(mod.runtime_scales())
-            out[name] = mod.indices.detach().cpu().clone()
+            # TQ1 codebook indices are at most 12 bits.  Keep the resumable
+            # freeze-gate snapshot compact instead of checkpointing int64.
+            out[name] = mod.indices.detach().to(device="cpu", dtype=torch.int16).clone()
     except ImportError:  # pragma: no cover
         pass
     return out

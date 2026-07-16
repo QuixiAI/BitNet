@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import json
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -378,6 +379,114 @@ class TQ1Linear(nn.Module):
         self.temperature_value.fill_(float(state["temperature"]))
         self.phase_code.fill_(_PHASES[state["phase"]])
         self.latent_weight.requires_grad_(state["phase"] != "frozen")
+
+
+class TQ1Embedding(TQ1Linear):
+    """One TQ1 latent/projection shared by token lookup and the output head.
+
+    The module deliberately lives at the input-embedding module path, so its
+    latent remains ``model.embed_tokens.weight`` in a training checkpoint.
+    :class:`TQ1OutputHead` owns no parameters or buffers and delegates its
+    linear consumer back to this exact object.
+    """
+
+    def __init__(self, *args, padding_idx: int | None = None,
+                 max_norm: float | None = None, norm_type: float = 2.0,
+                 scale_grad_by_freq: bool = False, sparse: bool = False,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        if sparse:
+            raise ValueError("TQ1 embedding QAT does not support sparse gradients")
+        self.padding_idx = padding_idx
+        self.max_norm = max_norm
+        self.norm_type = float(norm_type)
+        self.scale_grad_by_freq = bool(scale_grad_by_freq)
+        self.sparse = False
+        self.consumer_family = "shared_embedding_output_head"
+
+    @classmethod
+    def from_ptq(cls, embedding: nn.Embedding, result: PTQResult,
+                 codebook: Codebook, quant_spec: QuantSpec, *, profile: str,
+                 importance_diag: torch.Tensor | None = None,
+                 importance_cov8: torch.Tensor | None = None,
+                 **kwargs) -> "TQ1Embedding":
+        if result.row_scales is None:
+            raise ValueError("shared embedding/head QAT requires row scales")
+        return cls(
+            embedding.weight.detach(), result.row_scales, codebook, quant_spec,
+            profile=profile, importance_diag=importance_diag,
+            importance_cov8=importance_cov8, initial_indices=result.indices,
+            padding_idx=embedding.padding_idx, max_norm=embedding.max_norm,
+            norm_type=embedding.norm_type,
+            scale_grad_by_freq=embedding.scale_grad_by_freq,
+            sparse=embedding.sparse, **kwargs)
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.out_features
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.in_features
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if input_ids.dtype not in {
+                torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
+            raise ValueError("TQ1 embedding input must contain integer token ids")
+        weight = self.projected_weight()
+        return F.embedding(
+            input_ids, weight, self.padding_idx, self.max_norm, self.norm_type,
+            self.scale_grad_by_freq, self.sparse)
+
+    def linear(self, hidden: torch.Tensor) -> torch.Tensor:
+        activation = (a8_ste(hidden, self.activation_mode)
+                      if self.activation_mode != "none" else hidden)
+        return F.linear(activation, self.projected_weight().to(activation.dtype))
+
+    @torch.no_grad()
+    def shared_health(self, previous_indices: torch.Tensor | None = None) \
+            -> dict[str, Any]:
+        metrics: dict[str, Any] = self.health(previous_indices)
+        metrics["consumer_family"] = self.consumer_family
+        metrics["embedding_rows"] = self.num_embeddings
+        metrics["output_head_columns"] = self.embedding_dim
+        return metrics
+
+
+class TQ1OutputHead(nn.Module):
+    """Parameter-free output consumer for a :class:`TQ1Embedding`."""
+
+    def __init__(self, shared: TQ1Embedding):
+        super().__init__()
+        if not isinstance(shared, TQ1Embedding):
+            raise TypeError("TQ1OutputHead requires a TQ1Embedding")
+        object.__setattr__(self, "_shared_ref", weakref.ref(shared))
+        self.in_features = shared.embedding_dim
+        self.out_features = shared.num_embeddings
+        self.bias = None
+
+    @property
+    def shared_weight(self) -> TQ1Embedding:
+        value = self._shared_ref()
+        if value is None:  # pragma: no cover - model ownership keeps it alive
+            raise RuntimeError("shared TQ1 embedding was destroyed")
+        return value
+
+    @property
+    def weight(self) -> nn.Parameter:
+        return self.shared_weight.weight
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Hugging Face may call tie_weights() during save.  Accept only the
+        # already-shared object and do not register a duplicate Parameter.
+        if name == "weight" and "_shared_ref" in self.__dict__:
+            if value is not self.shared_weight.weight:
+                raise ValueError("cannot retie a TQ1 output head to a different weight")
+            return
+        super().__setattr__(name, value)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.shared_weight.linear(hidden)
 
 
 class TQ1Experts(nn.Module):

@@ -75,9 +75,12 @@ def main(argv=None) -> int:
         raise FileNotFoundError(state_path)
     trainer_state = torch.load(state_path, map_location="cpu", weights_only=False)
     controller = trainer_state.get("training_state", {}).get("tq1_controller")
-    if not controller or controller.get("phase") != "frozen" \
+    if not controller or controller.get("schema") != 2 \
+            or controller.get("domain") != "global_tokens" \
+            or controller.get("phase") != "frozen" \
             or not controller.get("export_qualified"):
-        raise ValueError("checkpoint did not pass the frozen-index export gates")
+        raise ValueError(
+            "checkpoint lacks a token-domain, frozen, export-qualified controller")
     profile = load_profile(args.profile)
     model, _ = load_converted(
         checkpoint, profile, backend="reference", dtype=torch.float32,

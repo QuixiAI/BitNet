@@ -16,7 +16,9 @@ class _Model(nn.Module):
     def __init__(self, tq1):
         super().__init__()
         self.x = tq1
+        self.embed = nn.Embedding(2, 2)
         self.lm_head = nn.Linear(2, 2, bias=False)
+        self.lm_head.weight = self.embed.weight
 
 
 def test_frozen_qat_export_is_index_and_scale_exact(tmp_path):
@@ -38,7 +40,9 @@ def test_frozen_qat_export_is_index_and_scale_exact(tmp_path):
         "x.weight", "x", pack_payload(indices, "tq1_v11-j-r"),
         logical_shape=(2, 256), profile="tq1_v11-j-r",
         codebook_id=book.id, row_scales=scales)
-    builder.add_non_tq1("lm_head.weight", torch.eye(2))
+    tied = torch.eye(2)
+    builder.add_non_tq1("embed.weight", tied)
+    builder.add_non_tq1("lm_head.weight", tied)
     source_files = tmp_path / "source_files"
     source_files.mkdir()
     (source_files / "config.json").write_text("{}")
@@ -58,3 +62,6 @@ def test_frozen_qat_export_is_index_and_scale_exact(tmp_path):
     expected_payload, expected_scales = module.export_projection()
     assert torch.equal(got_payload, expected_payload)
     assert torch.equal(got_scales, expected_scales)
+    assert reader.aliases["lm_head.weight"]["target"] == "embed.weight"
+    restored = reader.non_tq1_state_dict()
+    assert restored["lm_head.weight"] is restored["embed.weight"]

@@ -99,3 +99,29 @@ manual `floorf`/`fmodf` candidate was rejected for a 1.15–1.74× regression.
 Raw p20/p80/CV, environment, and the complete reproducible command are in
 `bitnet_train/perf/results/a8_round_even_20260715/run.jsonl` and the optimization
 notebook.
+
+## Budgeted cached-prefill/output-head repack
+
+The QI-5 runtime keeps packed batch-one decode and adds the opt-in,
+deterministically hashed `tq1_dense_f32_row_major_v1` layout. It is selected
+only when the policy budget covers the complete tensor. The 2026-07-15 M4 Max
+pass covered V11/V12 J-row, all A1 projection shapes, ragged N=513, M=32/64/128,
+and the real 128256×2048 tied head with 10 warmups and 30 iterations.
+
+At M=128, hot cached BLAS is 14.44–86.43× faster than packed batch execution;
+including first-use repack, every supported shape is 1.78–4.92× faster. M=32
+and M=64 still regress some first-use edge shapes, so the kept default
+short-prefill threshold is 128. Combined `atol=2e-5, rtol=2e-5` passes; maximum
+absolute/relative error is 1.0872e-4/3.4973e-6. The output head is 5.48× faster
+once hot but adds 1002 MiB and 550.3 ms to repack, with a roughly 29-token
+kernel break-even. It remains explicitly disabled unless a caller supplies the
+budget and output-head flag. Full tables and the keep/reject rationale are in
+`bitnet_train/perf/optimization_status.md`; model-level speed and energy are
+still unqualified.
+
+The companion real-vocabulary gather pass adds 32/128/512-token repeated-row
+and ragged `3x17` lookup cases, including the final vocabulary row. Every result
+was exactly equal to the unique-row scalar oracle. Median times were
+3.494/3.629/4.444/3.773 ms for 1/16/256/51 unique rows. Keep the packed
+unique-row gather and its regression coverage; these are standalone path
+measurements, not a speedup claim.

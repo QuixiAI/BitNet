@@ -36,15 +36,40 @@ LLAMA_TARGET_REGEXES = (
     r"model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)",
 )
 LLAMA_KEEP_FP_REGEXES = (r"lm_head",)
+LLAMA_SHARED_EMBEDDING_REGEX = r"model\.embed_tokens"
 
 
 @dataclass(frozen=True)
 class LinearInventory:
     target: tuple[str, ...]
     keep_fp: tuple[str, ...]
+    shared_tied: tuple[tuple[str, str], ...] = ()
 
     def state_dict_targets(self) -> tuple[str, ...]:
-        return tuple(name + ".weight" for name in self.target)
+        return tuple(name + ".weight" for name in self.target) + tuple(
+            embedding + ".weight" for embedding, _ in self.shared_tied)
+
+    def quantized_modules(self) -> tuple[str, ...]:
+        return self.target + tuple(embedding for embedding, _ in self.shared_tied)
+
+    def statistics_targets(self) -> tuple[str, ...]:
+        return self.quantized_modules()
+
+
+def _state_tensor_kinds(model: nn.Module) -> dict[str, str]:
+    parameters = {name for name, _ in model.named_parameters(remove_duplicate=False)}
+    buffers = {name for name, _ in model.named_buffers(remove_duplicate=False)}
+    overlap = parameters & buffers
+    if overlap:
+        raise ValueError(f"model state names are both parameters and buffers: {sorted(overlap)}")
+    kinds = {name: "parameter" for name in parameters}
+    kinds.update({name: "buffer" for name in buffers})
+    missing = {name for name, value in model.state_dict().items()
+               if isinstance(value, torch.Tensor)
+               and not name.endswith("._extra_state")} - set(kinds)
+    if missing:
+        raise ValueError(f"cannot classify model state tensors {sorted(missing)[:8]}")
+    return kinds
 
 
 def classify_model_linears(model: nn.Module, quant_spec: QuantSpec, *,
@@ -74,6 +99,35 @@ def classify_model_linears(model: nn.Module, quant_spec: QuantSpec, *,
             keep.append(name)
         else:
             unmatched.append(name)
+    shared: list[tuple[str, str]] = []
+    embedding_targets = [
+        (name, module) for name, module in model.named_modules()
+        if isinstance(module, nn.Embedding)
+        and any(pattern.fullmatch(name) for pattern in target_patterns)
+    ]
+    if quant_spec.shared_embedding_head:
+        if len(embedding_targets) != 1:
+            raise ValueError(
+                "shared embedding/head quantization requires exactly one targeted Embedding")
+        embedding_name, embedding = embedding_targets[0]
+        if any(pattern.fullmatch(embedding_name) for pattern in keep_patterns):
+            raise ValueError("shared embedding is both targeted and keep-FP")
+        if getattr(getattr(model, "config", None), "tie_word_embeddings", False) is not True:
+            raise ValueError("shared embedding/head quantization requires tied model config")
+        heads = [
+            name for name, module in model.named_modules()
+            if isinstance(module, nn.Linear) and module.weight is embedding.weight
+        ]
+        if len(heads) != 1:
+            raise ValueError("targeted embedding does not have one exact shared Linear head")
+        if heads[0] not in keep:
+            raise ValueError("the tied output head must be explicitly classified keep-FP")
+        if embedding.embedding_dim % 256 or 127 * embedding.embedding_dim > 2**31 - 1:
+            raise ValueError("shared embedding width violates TQ1/W2A8 requirements")
+        shared.append((embedding_name, heads[0]))
+    elif embedding_targets:
+        raise ValueError(
+            "target regex selects an Embedding but shared_embedding_head is disabled")
     if double or unmatched:
         raise ValueError(
             "TQ1 linear inventory is not total/disjoint: "
@@ -84,7 +138,7 @@ def classify_model_linears(model: nn.Module, quant_spec: QuantSpec, *,
             and len(target) != 7 * int(layers):
         raise ValueError(
             f"Llama target inventory has {len(target)} linears, expected {7 * int(layers)}")
-    return LinearInventory(tuple(sorted(target)), tuple(sorted(keep)))
+    return LinearInventory(tuple(sorted(target)), tuple(sorted(keep)), tuple(sorted(shared)))
 
 
 def scalar_pattern_corpus(model: nn.Module, inventory: LinearInventory, *,
@@ -92,7 +146,7 @@ def scalar_pattern_corpus(model: nn.Module, inventory: LinearInventory, *,
     """Build the Section 9 corpus using one ordinary initializer scale per row."""
     patterns: dict[str, torch.Tensor] = {}
     with torch.no_grad():
-        for name in inventory.target:
+        for name in inventory.quantized_modules():
             weight = model.get_submodule(name).weight.detach().float().cpu()
             scale = weight.abs().mean(dim=1, keepdim=True)
             denominator = torch.where(scale > 0, scale, torch.ones_like(scale))
@@ -145,16 +199,88 @@ def importance_for_module(statistics: Mapping[str, torch.Tensor], module_name: s
     return result
 
 
+def shared_importance_for_module(statistics: Mapping[str, torch.Tensor],
+                                 module_name: str, quant_spec: QuantSpec,
+                                 width: int) -> tuple[Importance, torch.Tensor]:
+    """Blend output-head sensitivity with embedding reconstruction sensitivity.
+
+    Token frequency weights the reported row reconstruction objective.  Since
+    format-v1 projects each row independently, multiplying one row's objective
+    by its frequency cannot alter that row's argmin; the embedding contribution
+    that can affect assignments is therefore an isotropic K-space term.
+    """
+    frequency_key = f"{module_name}.token_frequency"
+    if frequency_key not in statistics:
+        raise ValueError(
+            f"shared embedding/head PTQ requires token frequencies for {module_name}")
+    frequency = statistics[frequency_key].detach().double().cpu()
+    if frequency.ndim != 1 or int(frequency.sum()) <= 0 or torch.any(frequency < 0):
+        raise ValueError("shared embedding token-frequency statistics are invalid")
+    head = float(quant_spec.shared_head_importance)
+    embedding = float(quant_spec.shared_embedding_importance)
+    normalizer = head + embedding
+    head, embedding = head / normalizer, embedding / normalizer
+    mode = quant_spec.importance_mode
+    if mode in {"uniform", "diagonal"}:
+        diag = (torch.ones(width) if mode == "uniform" else
+                statistics.get(f"{module_name}.diag"))
+        if diag is None or tuple(diag.shape) != (width,):
+            raise ValueError(f"shared output-head diagonal is missing for {module_name}")
+        diag = diag.detach().float().cpu()
+        diag = diag / diag.mean().clamp_min(1e-30)
+        return Importance("diagonal", diag=head * diag + embedding), frequency
+    suffix, group = (("cov8", 8) if mode == "covariance8" else ("cov256", 256))
+    covariance = statistics.get(f"{module_name}.{suffix}")
+    expected = (width // group, group, group)
+    if covariance is None or tuple(covariance.shape) != expected:
+        raise ValueError(f"shared output-head {suffix} is missing for {module_name}")
+    covariance = covariance.detach().float().cpu()
+    identity = torch.eye(group)[None].expand(width // group, -1, -1)
+    blended = head * covariance + embedding * identity
+    return (Importance("covariance8", cov8=blended) if group == 8
+            else Importance("block256", cov256=blended)), frequency
+
+
+def _shared_projection_report(weight: torch.Tensor, result: PTQResult,
+                              frequency: torch.Tensor,
+                              quant_spec: QuantSpec) -> dict[str, Any]:
+    row_mse = (result.dequantized.float() - weight.detach().float().cpu()).square().mean(1)
+    probability = frequency.float() / frequency.sum().clamp_min(1)
+    return {
+        "consumer_family": "shared_embedding_output_head",
+        "head_importance_weight": quant_spec.shared_head_importance,
+        "embedding_importance_weight": quant_spec.shared_embedding_importance,
+        "embedding_frequency_weighted_mse": float((row_mse * probability).sum()),
+        "embedding_uniform_row_mse": float(row_mse.mean()),
+        "observed_unique_token_rows": int((frequency > 0).sum()),
+        "observed_token_count": int(frequency.sum()),
+        "single_projection_for_both_consumers": True,
+    }
+
+
 def collect_statistics(model: nn.Module, tokenizer, inventory: LinearInventory, *,
                        calibration_file: str | Path, output: str | Path,
                        modes: Sequence[str], sample_count: int,
                        sequence_cap: int, device: str | torch.device,
                        metadata: Mapping[str, Any], ridge_factor: float = 1e-5) -> Path:
     modules = {name: model.get_submodule(name) for name in inventory.target}
-    records = iter_calibration_records(
-        calibration_file, tokenizer, limit=sample_count, sequence_cap=sequence_cap)
+    for embedding_name, head_name in inventory.shared_tied:
+        # The output-head input carries the K=hidden sensitivity required by
+        # the shared matrix; embedding token ids are counted separately below.
+        modules[embedding_name] = model.get_submodule(head_name)
+    records = list(iter_calibration_records(
+        calibration_file, tokenizer, limit=sample_count, sequence_cap=sequence_cap))
     sums, collection = collect_model_statistics(
         model, modules, records, device=device, modes=modes)
+    extras: dict[str, torch.Tensor] = {}
+    for embedding_name, _ in inventory.shared_tied:
+        rows = int(model.get_submodule(embedding_name).weight.shape[0])
+        frequency = torch.zeros(rows, dtype=torch.int64)
+        for record in records:
+            frequency += torch.bincount(record.input_ids.cpu(), minlength=rows)[:rows]
+        if int(frequency.sum()) <= 0:
+            raise ValueError("shared embedding calibration collected no token ids")
+        extras[f"{embedding_name}.token_frequency"] = frequency
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     save_calibration_artifact(output, sums, metadata={
@@ -165,9 +291,10 @@ def collect_statistics(model: nn.Module, tokenizer, inventory: LinearInventory, 
         "modes": list(modes),
         "device": str(device),
         "accumulation_dtype": "float64_cpu",
-        "target_modules": list(inventory.target),
+        "target_modules": list(inventory.statistics_targets()),
+        "shared_tied_consumers": [list(value) for value in inventory.shared_tied],
         **collection,
-    }, ridge_factor=ridge_factor)
+    }, ridge_factor=ridge_factor, extra_tensors=extras)
     return output
 
 
@@ -297,6 +424,31 @@ def run_full_model_ptq(model: nn.Module, quant_spec: QuantSpec,
         tensor_results[state_name] = result
         reports[state_name] = result.report
         sizes[state_name] = module.weight.numel()
+    shared_consumers: dict[str, str] = {}
+    for module_name, head_name in inventory.shared_tied:
+        module: nn.Embedding = model.get_submodule(module_name)
+        profile, codebook_id = quant_spec.resolve_profile(module_name)
+        if profile in FLOAT_PROFILES or codebook_id is None:
+            raise ValueError("shared embedding/head target must resolve to a TQ1 profile")
+        importance, frequency = shared_importance_for_module(
+            statistics, module_name, quant_spec, module.embedding_dim)
+        result = project_weight(
+            module.weight, registry[codebook_id], importance,
+            _ptq_config(quant_spec, profile, chunk_groups=chunk_groups,
+                        allow_diagonal_fallback=allow_diagonal_fallback))
+        state_name = module_name + ".weight"
+        result.report.update({
+            "module_path": module_name,
+            "state_dict_name": state_name,
+            "physical_payload_bytes": result.payload.numel(),
+            "row_scale_bytes": 0 if result.row_scales is None
+            else result.row_scales.numel() * result.row_scales.element_size(),
+            **_shared_projection_report(module.weight, result, frequency, quant_spec),
+        })
+        tensor_results[state_name] = result
+        reports[state_name] = result.report
+        sizes[state_name] = module.weight.numel()
+        shared_consumers[state_name] = head_name + ".weight"
 
     tokenizer_hash, template_hash = (tokenizer_identity(tokenizer) if tokenizer is not None
                                      else ("0" * 64, "0" * 64))
@@ -333,7 +485,10 @@ def run_full_model_ptq(model: nn.Module, quant_spec: QuantSpec,
             state_name, module_name, result.payload,
             logical_shape=tuple(model.get_submodule(module_name).weight.shape),
             profile=profile, codebook_id=codebook_id or "",
-            row_scales=result.row_scales)
+            row_scales=result.row_scales,
+            source_tensor=model.get_submodule(module_name).weight,
+            consumer_kind=("shared_embedding_head" if state_name in shared_consumers
+                           else "linear"))
     target_state_names = set(tensor_results)
     float_overrides = {
         name + ".weight": profile
@@ -341,12 +496,20 @@ def run_full_model_ptq(model: nn.Module, quant_spec: QuantSpec,
         for profile, _ in (quant_spec.resolve_profile(name),)
         if profile in FLOAT_PROFILES
     }
+    state_kinds = _state_tensor_kinds(model)
+    shared_alias_names = set(shared_consumers.values())
     for name, value in model.state_dict().items():
-        if name not in target_state_names:
+        if name not in target_state_names and name not in shared_alias_names:
             profile = float_overrides.get(name)
             dtype = ({"fp16": torch.float16, "bf16": torch.bfloat16,
                       "fp32": torch.float32}[profile] if profile else value.dtype)
-            builder.add_non_tq1(name, value.to(dtype))
+            builder.add_non_tq1(
+                name, value, dtype=dtype, logical_kind=state_kinds[name])
+    state = model.state_dict(keep_vars=True)
+    for target, alias in sorted(shared_consumers.items()):
+        builder.add_alias(
+            alias, target, state[alias], dtype=state[target].dtype,
+            logical_kind=state_kinds[alias])
     if not tensor_results:
         raise ValueError("resolved mixed policy contains no TQ1 tensors")
     resolved_policy = {
@@ -354,7 +517,7 @@ def run_full_model_ptq(model: nn.Module, quant_spec: QuantSpec,
             "profile": quant_spec.resolve_profile(name)[0],
             "codebook_id": quant_spec.resolve_profile(name)[1],
         }
-        for name in inventory.target
+        for name in inventory.quantized_modules()
     }
     report = {
         "schema": 1,
@@ -366,6 +529,9 @@ def run_full_model_ptq(model: nn.Module, quant_spec: QuantSpec,
         "aggregate": _aggregate_reports(reports, sizes),
         "resolved_tensor_policy": resolved_policy,
         "floating_override_tensors": sorted(float_overrides),
+        "shared_embedding_head": {
+            target: alias for target, alias in sorted(shared_consumers.items())
+        },
         "tensors": reports,
         "elapsed_seconds": time.perf_counter() - started,
     }
@@ -442,6 +608,11 @@ def bake_debug_checkpoint(artifact_dir: str | Path, output_dir: str | Path, *,
         if not config_path.is_file():
             raise FileNotFoundError("canonical artifact has no config.json")
         config = json.loads(config_path.read_text())
+        if reader.aliases.get("lm_head.weight", {}).get("target") \
+                == "model.embed_tokens.weight" \
+                and not config.get("tie_word_embeddings", False):
+            raise ValueError(
+                "artifact aliases lm_head but its HF config does not enable tied embeddings")
         config["quantization_config"] = {
             "quant_method": "tq1_v_debug_baked",
             "canonical_packed": False,
@@ -457,6 +628,8 @@ def bake_debug_checkpoint(artifact_dir: str | Path, output_dir: str | Path, *,
             "activation_quantization_automatic": False,
             "quant_spec_sha256": reader.manifest["quant_spec_sha256"],
             "tensors": [item["state_dict_name"] for item in reader.manifest["tensors"]],
+            "tensor_aliases": reader.aliases,
+            "alias_restoration": "hf_tie_weights" if reader.aliases else None,
         }, indent=2, sort_keys=True) + "\n")
         output.parent.mkdir(parents=True, exist_ok=True)
         os.replace(temp, output)
@@ -519,18 +692,46 @@ def export_qat_model(model: nn.Module, source_artifact: str | Path,
         builder.add_quantized(
             item["state_dict_name"], name, payload,
             logical_shape=tuple(item["logical_shape"]), profile=item["profile"],
-            codebook_id=item["codebook_id"], row_scales=scales)
-        reports[item["state_dict_name"]] = module.health()
+            codebook_id=item["codebook_id"], row_scales=scales,
+            source_tensor=module.weight, logical_kind=item.get("logical_kind", "parameter"),
+            consumer_kind=item.get("consumer_kind", "linear"))
+        reports[item["state_dict_name"]] = (
+            module.shared_health() if hasattr(module, "shared_health") else module.health())
     state = model.state_dict()
+    state_kinds = _state_tensor_kinds(model)
     expected_non_tq1 = set(source.manifest["non_tq1_tensors"])
-    absent = expected_non_tq1 - set(state)
+    quantized_names = {item["state_dict_name"] for item in source.manifest["tensors"]}
+    non_tq1_aliases = {
+        name for name, alias in source.aliases.items()
+        if alias["target"] not in quantized_names
+    }
+    expected_logical_non_tq1 = expected_non_tq1 | non_tq1_aliases
+    absent = expected_logical_non_tq1 - set(state)
     if absent:
         raise ValueError(f"QAT checkpoint lacks non-TQ1 tensors {sorted(absent)[:8]}")
+    source_non_tq1 = source.non_tq1_state_dict(include_aliases=False)
     for name in sorted(expected_non_tq1):
         value = state[name]
         if not isinstance(value, torch.Tensor):
             raise ValueError(f"{name}: non-TQ1 state is not a tensor")
-        builder.add_non_tq1(name, value)
+        source_meta = source.manifest["non_tq1_tensors"][name]
+        builder.add_non_tq1(
+            name, value, dtype=source_non_tq1[name].dtype,
+            logical_kind=source_meta.get("kind", state_kinds[name]))
+    for name, alias in sorted(source.aliases.items()):
+        if alias["target"] in quantized_names:
+            alias_module = model.get_submodule(name.removesuffix(".weight"))
+            target_module = model.get_submodule(alias["target"].removesuffix(".weight"))
+            if getattr(alias_module, "shared_weight", None) is not target_module:
+                raise ValueError(f"QAT model did not restore quantized alias {name}")
+            builder.add_alias(
+                name, alias["target"], alias_module.weight,
+                dtype=target_module.weight.dtype, logical_kind=alias["kind"])
+        else:
+            builder.add_alias(
+                name, alias["target"], state[name],
+                dtype=source_non_tq1[alias["target"]].dtype,
+                logical_kind=alias["kind"])
     quantization_report = {
         "schema": 1,
         "producer": "qat",

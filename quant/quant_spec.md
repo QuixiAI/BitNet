@@ -1365,10 +1365,10 @@ Entry requires:
 - acceptable assignment margins;
 - no dead-codeword or scale pathology requiring intervention.
 
-A configured freeze step is the earliest eligibility point, not permission to
-bypass these gates. If the gates are unmet at the configured maximum hard-phase
-step, the run ends without a frozen/export-qualified claim and records which
-gates failed.
+A configured freeze-token position is the earliest eligibility point, not
+permission to bypass these gates. If the gates are unmet at the configured
+maximum hard-phase token position, the run stops unsuccessfully, saves its exact
+controller/data position, and records which gates failed.
 
 Indices become immutable. Latent weights are frozen or removed from the
 forward. Trainable parameters are limited to row scales, norms, allowed FP
@@ -1385,7 +1385,7 @@ reprojected before indices are frozen again.
 
 ### 12.7 QAT health metrics
 
-At step zero and every evaluation interval, record per tensor and aggregate:
+At token zero and every declared evaluation interval, record per tensor and aggregate:
 
 - index flip rate;
 - changed trits per group;
@@ -1419,6 +1419,12 @@ Checkpoints MUST include:
 - RNG states;
 - distributed model state;
 - exact data-stream resume position.
+- token-domain QAT schedule, phase, gate history, last global token position,
+  last gate-observation position, and the code snapshot defining the next flip
+  interval;
+- global tokens per optimizer step and distributed world size; a topology or
+  batch-geometry change is rejected unless a separately specified resharding
+  migration proves the data stream remains exact.
 
 FSDP saves MUST use a gathered full state dict or the framework’s distributed
 checkpoint API. Rank-zero `save_pretrained` on a sharded module is not
@@ -1511,9 +1517,68 @@ canonical bytes; FP16/BF16 companions use their little-endian 16-bit payloads.
 Other multibyte tensors likewise use their declared dtype's little-endian bit
 representation.
 File-level SHA-256 values are recorded separately for transport integrity.
+The `files` mapping is the exact top-level regular-file inventory other than the
+manifest itself; unlisted or missing files are fatal.
 
 Unknown required fields are fatal. Readers may ignore unknown optional fields
 only when their names are listed in `optional_extensions`.
+
+The QI-0 schema-2 alias extension consists of `tensor_aliases` and
+`tensor_aliases_sha256`; both names appear in `optional_extensions`. The former
+is a canonical-JSON object keyed by logical state-dict alias. Each value has
+exactly:
+
+~~~json
+{
+  "target": "model.embed_tokens.weight",
+  "shape": [128256, 2048],
+  "dtype": "float16",
+  "kind": "parameter"
+}
+~~~
+
+The target is the physical canonical tensor, not another alias. Alias names and
+physical names are disjoint; chains and cycles are forbidden. Shape, dtype, and
+parameter/buffer kind must equal the target metadata. The alias hash is SHA-256
+over canonical JSON of the alias object and is independent of the target tensor
+hash. An alias target may be either a physical
+`non_tq1_model.safetensors` tensor or a canonical quantized tensor. Quantized
+tensor manifests additionally declare `logical_dtype`, `logical_kind`, and
+`consumer_kind`; the shared tied matrix uses
+`consumer_kind=shared_embedding_head`. Readers fail on a missing target,
+hash mismatch, collision, chain/cycle, or metadata mismatch. Model loading must
+restore the same Python `Parameter`/buffer object and verify identity after
+`tie_weights`; equal clones are nonconformant. A quantized shared matrix stores
+one payload/scale pair for `model.embed_tokens.weight`; `lm_head.weight` is a
+logical alias to that quantized physical tensor. Llama GGUF export stores
+`token_embd.weight` in its declared low-bit type and omits `output.weight` for
+the tied embedding/head case.
+Such a Llama artifact is invalid unless `config.json` declares
+`tie_word_embeddings: true`.
+
+`size_accounting` is model-wide and separates logical references from physical
+storage. Newly written schema-2 artifacts contain at least:
+
+- `unique_logical_parameters`, `logical_parameter_references`,
+  `low_bit_unique_parameters`, and `high_precision_unique_parameters`;
+- total fixed-width `ideal_code_bits` and `ideal_code_bpw` over low-bit weights;
+- `packed_code_bytes`, embedded/row/total scale bytes, affine bytes, codebook
+  bytes, and explicit alignment bytes;
+- physical and logical-reference non-TQ1 bytes, physical model-storage bytes,
+  target-only bpw, and model-wide effective bpw over unique parameters;
+- both safetensors file sizes, their container overhead, manifest bytes, and
+  exact canonical-artifact bytes;
+- the baseline estimated decode stream (one traversal of physical parameter,
+  packed, scale, and codebook bytes); nullable final-GGUF,
+  backend-private-repack, resident-model, and measured decode-stream fields;
+  plus named optional-component and context-peak maps.
+
+The validator recomputes tensor counts, component byte sums, file/container
+overhead, manifest size, and the complete artifact-directory size. A mismatch is
+fatal. Measured deployment fields remain null/empty until observed: GGUF
+validation records the actual final file size, and a loaded runtime reports unique live
+tensor-storage bytes and backend repack bytes without counting tied aliases
+twice. No target-only bpw value may be presented as model-wide bpw.
 
 ### 13.4 Baked Hugging Face checkpoint
 
@@ -1784,15 +1849,26 @@ quant:
   top_m: 8
   temperature_start: 1.0
   temperature_end: 0.05
-  soft_steps: 1000
-  hard_steps: 4000
-  freeze_indices_at: null
+  soft_tokens: 33554432
+  hard_tokens: 134217728
+  freeze_eval_every_tokens: 16777216
+  freeze_indices_at_tokens: 167772160
+  freeze_max_tokens: 184549376
   margin: 0.1
   lambda_margin: 0.0
   tensor_overrides: []
 ~~~
 
 Unknown keys are fatal. Resolved values appear in checkpoint provenance.
+
+QAT phase boundaries and freeze-gate observations are expressed in global
+tokens, never optimizer steps. Before loading model weights, the trainer MUST
+verify that the total token budget reaches `freeze_max_tokens`, that every phase
+and observation boundary is exactly divisible by the run's global
+tokens-per-step, and that the hard phase contains at least
+`freeze_sustain_evals` observations. Checkpoints use the token-domain controller
+schema and record the exact global token position and most recent observation
+position. Legacy step-domain controller checkpoints are not implicitly migrated.
 
 ### 16.3 Export and verification
 
@@ -2090,3 +2166,216 @@ normative sections are updated.
 | llama.cpp type, GGUF, converter, and row-scale work | 14, 16.3 |
 | Development sequence | 20 |
 | Representation, quality, and systems evaluation | 17 |
+
+## 23. QI-1 baseline-matrix evidence protocol
+
+The QI-1 matrix is an immutable evidence state machine, not a spreadsheet that
+may be edited after results are known. Its experiment identity fixes the source
+model and license, source/tokenizer revisions, tokenizer and chat-template
+hashes, calibration and evaluation revisions/hashes, runtime configuration and
+its hash, repository commit, seeds, and tool versions.
+
+The required physical rows are:
+
+- FP32 dense teacher;
+- lossless full ternary INT2;
+- llama.cpp `TQ1_0`, `TQ2_0`, and `IQ1_S` with their full physical names;
+- ordinary ternary G128 INT2 plus FP16 group scales;
+- binary G128 plus FP16 group scales;
+- TQ1 V11-J and V12-J PTQ with row and block-256 scales;
+- TQ1 V11-J and V12-J row-scale QAT trained in W-only and W+A8 modes,
+  each cross-evaluated in every legal activation mode.
+
+Every row contains model-wide storage, CE/PPL, full teacher-KL distribution,
+top-token agreement, an identical task inventory, export parity, named decode
+and prefill timings, context memory, commands, and provenance. The dense result
+is recorded first and becomes immutable. Gates are then declared against the
+dense-result SHA-256 and become immutable. Candidate result templates cannot be
+opened before that gate hash exists. Candidate parity cannot use
+`not_applicable` to bypass a required `pass`, and task or timing rows may not be
+silently omitted. `complete` means every required row is present and hash-valid;
+it does not mean every candidate passed.
+
+The canonical state machine and CLI are `bitnet_train/tq1/baseline.py` and
+`quant/baseline_matrix.py`. A newly created or partially populated matrix is
+scaffolding, not an empirical 1B baseline result.
+
+## 24. QI-2 shared embedding/output-head contract
+
+When `QuantSpec.shared_embedding_head=true`, exactly one tied Llama embedding
+matrix is a TQ1 target. The source model must expose Python-object identity
+between `model.embed_tokens.weight` and `lm_head.weight`; equality without tying
+is rejected. Its width must satisfy the selected format's K constraints.
+
+Calibration hooks the output head's final-hidden input under the shared
+embedding module name and also stores a vocabulary-length token-frequency
+tensor. The projection importance is a declared nonnegative blend of
+output-head sensitivity and embedding reconstruction. Token-frequency-weighted
+embedding MSE is reported; token frequencies do not pretend to alter the
+independent per-row argmin when no cross-row budget exists. Merged calibration
+artifacts add compatible token-frequency counts rather than dropping or
+averaging them.
+
+PTQ and QAT use one latent weight, assignment state, runtime scale vector, and
+payload. The embedding lookup and output-linear consumers accumulate gradients
+into that same latent. The output-head adapter owns no Parameter. Export writes
+one quantized physical tensor and a quantized logical `lm_head.weight` alias.
+
+The scalar packed embedding decodes only unique requested rows. The output head
+uses packed W-only or W+A8 arithmetic. The native CPU route preserves packed row
+gather and may use the versioned output-head repack in Section 27. GGUF emits one
+low-bit `token_embd.weight` and no duplicate `output.weight`.
+
+Shared Q2/Q4/Q8 G128, with one FP16/BF16 scale per group, are explicit
+quality-gate alternatives. They use one tied latent and payload but are not
+silently substituted into a TQ1 artifact or GGUF physical type. Promotion of a
+fallback requires its own QI-1 row, artifact type, and runtime evidence.
+
+## 25. QI-3 healing-mixture and capability-evaluation contract
+
+### 25.1 Assistant-token-quota mixture
+
+A schema-3 mixture lists immutable dataset identity, revision, license, split,
+configuration, capability, language, supervised-assistant-token quota, context
+token target, and record-ID field for every source. It covers instruction,
+tools, math, code, multilingual, long-context, and ordinary-chat buckets. Both
+quota vectors sum to one and every bucket has positive mass.
+
+Scheduling chooses the largest assistant-token deficit; context tokens are
+recorded but never substituted as the scheduling unit. Conversations are
+normalized before a global canonical-message SHA-256 deduplication. Deterministic
+record-ID hashing assigns the validation split. The manifest records selected
+IDs and content hashes, assistant and context counts/shares, length statistics,
+rejections, duplicates, truncation, exact shards, tokenizer/chat-template
+hashes, and the mixture-spec hash. Overshoot is bounded by one selected
+conversation and appears in the effective quota tolerance.
+
+### 25.2 Pinned capability suite
+
+The required deterministic suite contains MMLU-Redux, MuSR, GSM8K, MATH-500,
+HumanEval+, MBPP+, IFEval, IFBench, BFCL-v3 single- and multi-turn, and pinned
+long-context tasks at 4K, 16K, and 32K. Every task fixes a full dataset revision,
+prompt-template hash, scorer/source hash, seed, backend, generation budget, and
+determinism flag. Code and tool tasks additionally fix an execution-container
+digest. Scorers are restricted by task: multiple choice, numeric extraction,
+constraint checks, canonical JSON/AST, pinned-container execution, or exact
+retrieval. A scorer returns a parse failure rather than invoking an unattributed
+LLM; any subsequent LLM fallback is counted and may occur only after such a
+failure.
+
+The report names W-only and W+A8 separately, uses the exact dense task
+inventory, carries mean/p50/p95/p99 teacher KL, length and language buckets, and
+an exact rerun. Gates are bound to the dense result before candidate evaluation
+and are recomputed from raw task scores: aggregate retention, per-capability
+retention, maximum task regression, KL tails, and rerun stability.
+
+## 26. QI-4 calibrated KV-cache contract
+
+KV Q4 is an optional memory format; no speed property follows from its bpw. The
+permanent oracle uses explicit `[batch, kv_head, token, channel]` keys and FP64
+CPU sums to learn one FP32 key-channel mean per layer/head/channel. Every layer
+must observe the same nonzero token count.
+
+The separately hashed safetensors artifact is linked by a companion manifest to
+the exact model-artifact SHA-256. Its contract fixes model/tokenizer identities,
+layer count, KV-head count, head dimension, source KV dtype, pre- or post-RoPE
+state, attention implementation, sorted context lengths, record/token counts,
+source hashes, accumulation dtype, and statistic. Production loading requires a
+runtime identity and rejects any model, layer, head, channel, dtype, rotation,
+attention, contract, or file-hash mismatch.
+
+Q8 stores signed int8 codes plus one FP16 scale per token/head. Q4 stores two
+symmetric `[-7,7]` codes per byte, reserves nibble 15, and uses one FP16 scale
+per token/head. Values are ordinary symmetric quantization. Q4 keys may first
+subtract the calibrated per-channel mean and restore it after dequantization.
+FP16, Q8, centered Q4, and uncentered-Q4 ablation results remain distinct.
+
+Evaluation compares each mode with that model's own FP16 cache on both its own
+generations and off-policy long contexts. It records forward-KL mean/p50/p95/p99,
+downstream scores, and one identical inventory of at least two numeric context
+lengths. Peak cache bytes, decode-latency p20/median/p80, and prefill-latency
+p20/median/p80 are separate maps keyed by every context length; an aggregate
+latency number cannot satisfy this contract. An optional hard-forward/identity-STE
+Q4 or Q8 fake quantizer is an ablation and may enter training only after this
+inference baseline exists.
+
+## 27. QI-5 private repack, routing, and systems evidence
+
+The native CPU runtime keeps canonical packed batch-one decode. Its initial
+private representation is the versioned expanded int8 codebook and legal-index
+bitmap. A second opt-in layout,
+`tq1_dense_f32_row_major_v1`, is a deterministic exact dequantization of the
+canonical weight for BLAS prefill or output-head decode. It is lazy, immutable
+after construction, independently hashed, and permitted only when the routing
+policy's byte budget covers the complete tensor. Canonical packed storage
+remains resident. Reports include layout version, resident bytes, repack time,
+construction temporary-memory bound, hash, and route counts.
+
+Routing distinguishes packed decode, packed small batch, dense short prefill,
+dense long prefill, and optional dense output-head decode. Short/long thresholds,
+output-head policy, and memory budget are explicit configuration and provenance;
+zero budget disables dense repacking. W+A8 activation quantization remains part
+of both packed and dense comparisons. The denser route may differ in floating
+accumulation order and must pass its declared combined absolute/relative oracle
+tolerance.
+
+Kernel evidence follows the repository performance rule. Model-level evidence
+is separate and requires `tg128`, `pp512`, TTFT at at least three prompt lengths,
+output-head decode share, canonical/private/resident bytes, peak bytes at named
+contexts, at least 60 seconds of windowed throughput plus thermal state, and
+measured average power, energy, generated tokens, and reconciled joules/token.
+A kernel A/B does not satisfy this model-level schema.
+
+## 28. QI-6 cost-gated speculative decoding
+
+No drafter may be instantiated from a negative or absent measured cost gate.
+The cost document fixes model artifact, backend, workload, device/toolchain,
+baseline target-decode p20/median/p80, and candidate block measurements. The
+sweep includes block size four and may test sizes two through eight. Each row
+records drafter, target-verification, and scheduling cost; a full acceptance
+histogram; resident bytes; prompt-cache reuse; re-prefill tokens; and service
+cost for multiple workloads including multi-turn.
+
+For block size `B`, the greedy lossless verifier emits the accepted draft prefix
+and exactly one target mismatch or all-accepted bonus token. Thus the measured
+cost model uses
+
+```text
+projected_ms_per_token =
+    (draft_block_ms + target_verify_ms + scheduler_ms)
+    / (E[accepted_draft_tokens] + 1)
+```
+
+Eligibility also requires the predeclared speedup, resident-byte, and maximum
+workload-regression gates, zero re-prefill, and prompt-cache reuse. The selected
+block minimizes projected total cost, not merely maximizes accepted length.
+
+The gated reference drafter consumes normalized taps from at least two named
+target layers, creates block-parallel base logits, applies a shared lightweight
+sequential correction to reduce suffix decay, and predicts per-position
+survival. Distillation weights token KL by prefix reachability and trains the
+survival head against a monotonic accepted-prefix target. Greedy verification is
+target-lossless by construction; other sampling policies require their own
+exact verifier before being named supported.
+
+The explicit Q8-row/FP16-scale drafter reference removes floating Linear and
+Embedding weights while retaining norm parameters. Its logit error, survival
+error, top-token agreement, parameter coverage, and resident bytes are reported.
+Final service evidence is hash-bound to the cost decision and drafter artifact
+and includes prompt-cache reuse, more than one concurrency level, resident
+drafter bytes, acceptance distribution, and end-to-end code and multi-turn
+timings with zero re-prefill. It must remain inside the cost decision's resident
+byte and workload-regression gates. Quantized parity predeclares and enforces
+maximum absolute error, maximum relative error, survival-logit error, and minimum
+top-token agreement rather than reporting ungated diagnostics.
+
+## 29. Evidence status versus implementation status
+
+Implementing the schemas, scalar oracles, CLIs, and fail-closed gates does not
+populate production evidence. QI-1 is empirically complete only after the real
+1B matrix reaches `complete`. QI-2 is promoted only after the shared matrix
+passes capability gates. QI-4 remains optional until its linked calibration and
+evaluation reports exist. QI-5 speed/energy promotion requires the model-level
+report in Section 27 in addition to kernel A/Bs. QI-6 remains disabled unless an
+actual named workload produces an eligible cost decision and its service report
+passes. Synthetic unit fixtures prove contract behavior only.

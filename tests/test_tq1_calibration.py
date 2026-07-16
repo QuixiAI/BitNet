@@ -93,11 +93,12 @@ def test_artifact_merge_uses_raw_sums_and_rejects_identity_mismatch(tmp_path):
         sums = ModuleSums(256, frozenset(("diagonal", "covariance8")))
         sums.add(part)
         path = tmp_path / f"part{index}.safetensors"
+        frequencies = torch.tensor([index + 1, 2 * index + 1], dtype=torch.int64)
         save_calibration_artifact(path, {"layer": sums}, metadata={
             **identity, "records": 1, "retained_tokens": len(part),
             "truncated_tokens": index, "bucket_tokens": {"unit": len(part)},
             "calibration_file_sha256": str(index) * 64,
-        })
+        }, extra_tensors={"model.embed_tokens.token_frequency": frequencies})
         paths.append(path)
     merged = merge_calibration_artifacts(paths, tmp_path / "merged.safetensors")
     got, metadata = load_calibration_sums(merged)
@@ -108,6 +109,9 @@ def test_artifact_merge_uses_raw_sums_and_rejects_identity_mismatch(tmp_path):
     assert got["layer"].token_count == 9
     assert metadata["records"] == 2 and metadata["bucket_tokens"] == {"unit": 9}
     assert metadata["truncated_tokens"] == 1
+    tensors, _ = load_calibration_artifact(merged)
+    assert torch.equal(
+        tensors["model.embed_tokens.token_frequency"], torch.tensor([3, 4]))
 
     bad_sums = ModuleSums(256, frozenset(("diagonal", "covariance8")))
     bad_sums.add(x[:1])

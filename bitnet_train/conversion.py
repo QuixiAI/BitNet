@@ -94,16 +94,22 @@ def load_profile(path: str | Path) -> ArchProfile:
         allowed = {
             "scheme", "spec", "artifact", "default_profile", "default_codebook_id",
             "activation_mode", "importance_stats", "qat_projection", "candidate_count",
-            "top_m", "temperature_start", "temperature_end", "soft_steps", "hard_steps",
-            "freeze_indices_at", "margin", "lambda_margin", "tensor_overrides",
+            "top_m", "temperature_start", "temperature_end", "soft_tokens", "hard_tokens",
+            "freeze_eval_every_tokens", "freeze_indices_at_tokens", "freeze_max_tokens",
+            "margin", "lambda_margin", "tensor_overrides",
             "assignment_chunk", "lambda_hidden", "hidden_layers",
-            "freeze_max_step", "freeze_flip_threshold", "freeze_margin_threshold",
-            "freeze_sustain_evals", "freeze_trend_tolerance",
+            "freeze_flip_threshold", "freeze_margin_threshold", "freeze_sustain_evals",
+            "freeze_trend_tolerance",
+            "shared_embedding_head", "shared_head_importance",
+            "shared_embedding_importance",
         }
         unknown = set(prof.quant) - allowed
         if unknown:
             raise ValueError(f"profile {prof.name}: unknown TQ1 quant keys {sorted(unknown)}")
-        required = {"artifact", "default_profile", "default_codebook_id", "qat_projection"}
+        required = {
+            "artifact", "default_profile", "default_codebook_id", "qat_projection",
+            "soft_tokens", "hard_tokens", "freeze_eval_every_tokens",
+        }
         missing = required - set(prof.quant)
         if missing:
             raise ValueError(f"profile {prof.name}: missing TQ1 quant keys {sorted(missing)}")
@@ -256,7 +262,7 @@ def _convert_tq1(model: nn.Module, profile: ArchProfile,
     from bitnet_train.tq1.artifact import ArtifactReader
     from bitnet_train.tq1.calibration import load_calibration_artifact
     from bitnet_train.tq1.packing import unpack_payload
-    from bitnet_train.tq1.qat import TQ1Linear
+    from bitnet_train.tq1.qat import TQ1Embedding, TQ1Linear, TQ1OutputHead
     from bitnet_train.tq1.spec import FLOAT_PROFILES
 
     artifact_path = artifact_path or profile.quant.get("artifact")
@@ -269,6 +275,13 @@ def _convert_tq1(model: nn.Module, profile: ArchProfile,
         raise ValueError("profile default TQ1 format differs from canonical artifact")
     if profile.quant.get("default_codebook_id") != quant_spec.default_codebook_id:
         raise ValueError("profile default codebook differs from canonical artifact")
+    if "shared_embedding_head" in profile.quant \
+            and bool(profile.quant["shared_embedding_head"]) \
+            != quant_spec.shared_embedding_head:
+        raise ValueError("profile shared embedding/head policy differs from canonical artifact")
+    for name in ("shared_head_importance", "shared_embedding_importance"):
+        if name in profile.quant and float(profile.quant[name]) != getattr(quant_spec, name):
+            raise ValueError(f"profile {name} differs from canonical artifact")
     configured_spec = profile.quant.get("spec")
     if configured_spec:
         raw = json.loads(Path(configured_spec).read_text())
@@ -289,10 +302,16 @@ def _convert_tq1(model: nn.Module, profile: ArchProfile,
     float_overrides = sorted(set(configured_targets) - set(target_names))
     kept = sorted([name for name, kind in classes.items() if kind == KEEP_FP]
                   + float_overrides)
-    artifact_names = sorted(item["module_path"] for item in reader.manifest["tensors"])
+    linear_items = [item for item in reader.manifest["tensors"]
+                    if item.get("consumer_kind", "linear") == "linear"]
+    shared_items = [item for item in reader.manifest["tensors"]
+                    if item.get("consumer_kind", "linear") == "shared_embedding_head"]
+    artifact_names = sorted(item["module_path"] for item in linear_items)
     if artifact_names != target_names:
         raise ValueError(f"TQ1 artifact/profile inventory mismatch: expected={target_names}, "
                          f"artifact={artifact_names}")
+    if bool(shared_items) != quant_spec.shared_embedding_head or len(shared_items) > 1:
+        raise ValueError("TQ1 artifact shared embedding/head inventory is inconsistent")
     tern_params = 0
     for name in target_names:
         old: nn.Linear = model.get_submodule(name)
@@ -318,16 +337,57 @@ def _convert_tq1(model: nn.Module, profile: ArchProfile,
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
         setattr(parent, name.rsplit(".", 1)[-1], new)
         tern_params += new.weight.numel()
+    shared_names: list[str] = []
+    if shared_items:
+        item = shared_items[0]
+        name = item["module_path"]
+        old = model.get_submodule(name)
+        if not isinstance(old, nn.Embedding):
+            raise ValueError(f"{name}: shared TQ1 target is not an Embedding")
+        aliases = [alias_name for alias_name, alias in reader.aliases.items()
+                   if alias["target"] == item["state_dict_name"]]
+        if aliases != ["lm_head.weight"] or old.weight is not model.lm_head.weight:
+            raise ValueError("shared TQ1 artifact/model does not preserve tied head identity")
+        _, payload, scales = reader.tensor(item["state_dict_name"])
+        if scales is None:
+            raise ValueError("shared embedding/head QAT requires row scales")
+        indices, _, _ = unpack_payload(payload, item["profile"])
+        from bitnet_train.tq1.pipeline import shared_importance_for_module
+        shared_importance, _ = shared_importance_for_module(
+            statistics, name, quant_spec, old.embedding_dim)
+        if shared_importance.mode == "block256":
+            raise ValueError("shared QAT supports diagonal/covariance8 importance, not cov256")
+        shared = TQ1Embedding(
+            old.weight.detach(), scales, registry[item["codebook_id"]], quant_spec,
+            profile=item["profile"], importance_diag=shared_importance.diag,
+            importance_cov8=shared_importance.cov8, initial_indices=indices,
+            phase=profile.quant.get("qat_projection", "soft"),
+            top_m=int(profile.quant.get("top_m", 8)),
+            temperature=float(profile.quant.get("temperature_start", 1.0)),
+            assignment_chunk=int(profile.quant.get("assignment_chunk", 2048)),
+            padding_idx=old.padding_idx, max_norm=old.max_norm,
+            norm_type=old.norm_type, scale_grad_by_freq=old.scale_grad_by_freq,
+            sparse=old.sparse)
+        shared.weight.requires_grad_(old.weight.requires_grad)
+        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+        setattr(parent, name.rsplit(".", 1)[-1], shared)
+        model.lm_head = TQ1OutputHead(shared)
+        tern_params += shared.weight.numel()
+        shared_names.append(name)
+        reader.verify_model_aliases(model)
     total_params = sum(parameter.numel() for parameter in model.parameters())
     lin_flops = tern_params + sum(
         module.weight.numel() for module_name, module in model.named_modules()
         if isinstance(module, nn.Linear))
     family_counts: dict[str, int] = {}
-    for name in target_names:
+    for name in target_names + shared_names:
         family_counts[_family(name)] = family_counts.get(_family(name), 0) + 1
     return ConversionReport(
-        profile=profile.name, n_ternarized=len(target_names), n_kept_fp=len(kept),
-        ternarized=target_names, kept_fp=kept, family_counts=family_counts,
+        profile=profile.name, n_ternarized=len(target_names) + len(shared_names),
+        n_kept_fp=len(kept) - len(shared_names),
+        ternarized=target_names + shared_names,
+        kept_fp=[name for name in kept if name != "lm_head"],
+        family_counts=family_counts,
         ternary_param_fraction=tern_params / max(total_params, 1),
         ternary_flop_fraction=tern_params / max(lin_flops, 1),
     )
