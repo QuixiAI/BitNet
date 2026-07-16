@@ -5,7 +5,7 @@ import torch
 
 from bitnet_train.tq1.artifact import ArtifactBuilder
 from bitnet_train.tq1.codebook import (
-    CodebookRegistry, base3_ids, direct_joint_codebook, product_codebook,
+    CodebookRegistry, base3_ids, load_iq1_reference, product_codebook,
     sign_canonical_codebook)
 from bitnet_train.export.compare_gguf import tq1_tensor_parity
 from bitnet_train.tq1.gguf import rewrite_base_gguf, validate_tq1_gguf
@@ -205,12 +205,10 @@ def _four_lane_universe():
 def _profile_book(profile):
     fmt = "v11" if "v11" in profile else "v12"
     if "-i-" in profile:
-        universe = ternary_universe()
-        zero = universe[(universe == 0).all(1)]
-        nonzero = universe[~(universe == 0).all(1)][:2047]
-        return direct_joint_codebook(
-            "gguf_i", torch.cat((nonzero[:1029], zero, nonzero[1029:])),
-            scope="loaded")
+        try:
+            return load_iq1_reference("gguf_i")
+        except (FileNotFoundError, ValueError) as exc:
+            pytest.skip(f"pinned read-only IQ1 reference is unavailable: {exc}")
     if "-p-" in profile:
         universe = _four_lane_universe()
         nonzero = universe != 0

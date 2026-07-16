@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import heapq
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -42,11 +42,55 @@ class PatternCorpus:
             covariance = self.covariance.detach().double().cpu().contiguous()
             if tuple(covariance.shape) != (6561, 8, 8) or not torch.isfinite(covariance).all():
                 raise ValueError("pattern covariance must be finite [6561,8,8]")
+            if not torch.allclose(
+                    covariance, covariance.transpose(-1, -2),
+                    atol=1e-10, rtol=1e-10):
+                raise ValueError("pattern covariance must be symmetric")
+            minimum = float(torch.linalg.eigvalsh(covariance).min())
+            if minimum < -1e-9:
+                raise ValueError(
+                    f"pattern covariance must be positive semidefinite (min={minimum})")
             object.__setattr__(self, "covariance", covariance)
 
     @classmethod
     def from_counts(cls, counts: torch.Tensor) -> "PatternCorpus":
         return cls(torch.as_tensor(counts, dtype=torch.float64))
+
+
+def combine_pattern_corpora(corpora: Sequence[PatternCorpus], *,
+                            normalize_each: bool = False) -> PatternCorpus:
+    """Combine demand and conditional sensitivity without averaging averages."""
+    items = list(corpora)
+    if not items:
+        raise ValueError("cannot combine an empty pattern-corpus inventory")
+    diagonal = items[0].diagonal is not None
+    covariance = items[0].covariance is not None
+    if any((item.diagonal is not None) != diagonal
+           or (item.covariance is not None) != covariance for item in items):
+        raise ValueError("pattern corpora use incompatible sensitivity metrics")
+    demand = torch.zeros(6561, dtype=torch.float64)
+    metric_sum = None
+    if diagonal:
+        metric_sum = torch.zeros((6561, 8), dtype=torch.float64)
+    elif covariance:
+        metric_sum = torch.zeros((6561, 8, 8), dtype=torch.float64)
+    for item in items:
+        scale = 1.0 / float(item.demand.sum()) if normalize_each else 1.0
+        weighted_demand = item.demand * scale
+        demand += weighted_demand
+        metric = item.diagonal if diagonal else item.covariance
+        if metric is not None and metric_sum is not None:
+            multiplier = weighted_demand.reshape(
+                -1, *([1] * (metric.ndim - 1)))
+            metric_sum += metric * multiplier
+    if metric_sum is None:
+        return PatternCorpus(demand)
+    averaged = torch.zeros_like(metric_sum)
+    positive = demand > 0
+    divisor = demand[positive].reshape(-1, *([1] * (metric_sum.ndim - 1)))
+    averaged[positive] = metric_sum[positive] / divisor
+    return (PatternCorpus(demand, diagonal=averaged) if diagonal
+            else PatternCorpus(demand, covariance=averaged))
 
 
 def _family(name: str) -> str:
@@ -64,10 +108,13 @@ def corpus_from_tensors(patterns: Mapping[str, torch.Tensor], *,
         raise ValueError("unsupported corpus weighting")
     encoded: dict[str, torch.Tensor] = {}
     for name, value in patterns.items():
-        groups = value.detach().to(torch.int8).cpu().reshape(-1, 8)
-        if not torch.all((groups >= -1) & (groups <= 1)):
-            raise ValueError(f"{name}: pattern corpus contains a non-trit")
-        encoded[name] = base3_ids(groups)
+        raw = value.detach().cpu()
+        if raw.numel() % 8:
+            raise ValueError(f"{name}: pattern corpus size is not divisible by eight")
+        try:
+            encoded[name] = base3_ids(raw.reshape(-1, 8))
+        except ValueError as exc:
+            raise ValueError(f"{name}: pattern corpus contains a non-trit") from exc
     if not encoded:
         raise ValueError("pattern corpus is empty")
     counts = torch.zeros(6561, dtype=torch.float64)
@@ -86,6 +133,91 @@ def corpus_from_tensors(patterns: Mapping[str, torch.Tensor], *,
             for values in values_by_tensor:
                 counts += torch.bincount(values, minlength=6561).double() / family_groups
     return PatternCorpus(counts)
+
+
+def sensitivity_corpus_from_tensors(
+        patterns: Mapping[str, torch.Tensor], *,
+        diagonal: Mapping[str, torch.Tensor] | None = None,
+        covariance: Mapping[str, torch.Tensor] | None = None,
+        weighting: str = "family_equal", row_chunk: int = 64) -> PatternCorpus:
+    """Aggregate `[N,K]` trits and group sensitivities by base-3 pattern.
+
+    Calibration sensitivity is shared by every output row of one matrix.  Row
+    chunking avoids materializing an `[N,K/8,8,8]` covariance expansion for
+    large FFN projections while retaining exact FP64 weighted sums.
+    """
+    if weighting not in {"parameter", "tensor_equal", "family_equal"}:
+        raise ValueError("unsupported corpus weighting")
+    if (diagonal is None) == (covariance is None):
+        raise ValueError("sensitivity corpus requires exactly one metric inventory")
+    if isinstance(row_chunk, bool) or not isinstance(row_chunk, int) or row_chunk < 1:
+        raise ValueError("sensitivity corpus row chunk must be positive")
+    metric_inventory = diagonal if diagonal is not None else covariance
+    assert metric_inventory is not None
+    if not patterns or set(patterns) != set(metric_inventory):
+        raise ValueError("pattern and sensitivity tensor inventories must match exactly")
+
+    encoded: dict[str, torch.Tensor] = {}
+    metrics: dict[str, torch.Tensor] = {}
+    group_counts: dict[str, int] = {}
+    for name, value in patterns.items():
+        trits = value.detach().cpu()
+        if trits.ndim != 2 or trits.shape[1] % 8:
+            raise ValueError(f"{name}: sensitivity patterns must have shape [N,K], K%8=0")
+        rows, width = trits.shape
+        try:
+            encoded[name] = base3_ids(trits.reshape(rows, width // 8, 8))
+        except ValueError as exc:
+            raise ValueError(f"{name}: pattern corpus contains a non-trit") from exc
+        metric = metric_inventory[name].detach().double().cpu().contiguous()
+        expected = ((width // 8, 8) if diagonal is not None
+                    else (width // 8, 8, 8))
+        if diagonal is not None and tuple(metric.shape) == (width,):
+            metric = metric.reshape(expected)
+        if tuple(metric.shape) != expected or not torch.isfinite(metric).all():
+            raise ValueError(f"{name}: sensitivity shape must be {expected} and finite")
+        if diagonal is not None and torch.any(metric < 0):
+            raise ValueError(f"{name}: diagonal sensitivity must be nonnegative")
+        metrics[name] = metric
+        group_counts[name] = rows * (width // 8)
+
+    coefficients: dict[str, float] = {}
+    if weighting == "parameter":
+        coefficients = {name: 1.0 for name in patterns}
+    elif weighting == "tensor_equal":
+        coefficients = {name: 1.0 / group_counts[name] for name in patterns}
+    else:
+        family_counts: dict[str, int] = {}
+        for name, count in group_counts.items():
+            family_counts[_family(name)] = family_counts.get(_family(name), 0) + count
+        coefficients = {
+            name: 1.0 / family_counts[_family(name)] for name in patterns
+        }
+
+    demand = torch.zeros(6561, dtype=torch.float64)
+    metric_sum = torch.zeros(
+        (6561, 8) if diagonal is not None else (6561, 8, 8),
+        dtype=torch.float64)
+    for name, ids in encoded.items():
+        rows, groups = ids.shape
+        metric = metrics[name]
+        coefficient = coefficients[name]
+        for start in range(0, rows, row_chunk):
+            count = min(row_chunk, rows - start)
+            flat_ids = ids[start:start + count].reshape(-1)
+            weights = torch.full(
+                (flat_ids.numel(),), coefficient, dtype=torch.float64)
+            demand.index_add_(0, flat_ids, weights)
+            expanded = metric.unsqueeze(0).expand(count, *metric.shape) \
+                .reshape(flat_ids.numel(), *metric.shape[1:])
+            metric_sum.index_add_(
+                0, flat_ids, expanded * coefficient)
+    positive = demand > 0
+    averaged = torch.zeros_like(metric_sum)
+    divisor = demand[positive].reshape(-1, *([1] * (metric_sum.ndim - 1)))
+    averaged[positive] = metric_sum[positive] / divisor
+    return (PatternCorpus(demand, diagonal=averaged) if diagonal is not None
+            else PatternCorpus(demand, covariance=averaged))
 
 
 def canonical_shapes() -> torch.Tensor:
@@ -239,6 +371,9 @@ def facility_location_select(corpus: PatternCorpus, *, select_count: int,
         "algorithm": "exact_greedy_facility_location+best_improvement_swaps",
         "select_count": select_count,
         "anchor_count": len(anchors),
+        "anchor_base3_ids": [
+            int(value) for value in base3_ids(shapes[torch.tensor(anchors)]).tolist()
+        ],
         "lambda_nz": lambda_nz,
         "objectives": objectives if return_trace else [objectives[0], objectives[-1]],
         "swaps": swaps,
@@ -396,6 +531,7 @@ def build_product_codebook(codebook_id: str, index_format: str, corpus: PatternC
     return product_codebook(codebook_id, index_format, a, b, scope=scope,
                             provenance={
                                 "algorithm": "marginal_medoid+structured_full_objective_swaps",
+                                "initialization_objective": objectives[0],
                                 "objectives": objectives,
                                 "swap_limit": swap_limit,
                                 "termination": termination,

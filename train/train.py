@@ -26,6 +26,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any, Mapping
 
 import torch
 
@@ -52,6 +53,162 @@ def lr_scale(step, warmup, total, floor=0.10):
         return (step + 1) / max(1, warmup)
     t = (step - warmup) / max(1, total - warmup)
     return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(t, 1.0)))
+
+
+def tq1_health_record(health_metrics: Mapping[str, Mapping[str, Any]], *,
+                      event: str, step: int, tokens: int,
+                      quant_spec_sha256: str,
+                      model_metrics: Mapping[str, Any] | None = None,
+                      training_metrics: Mapping[str, Any] | None = None,
+                      controller: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Build one durable Section 12.7 per-tensor + aggregate health record."""
+    from bitnet_train.tq1.qat import aggregate_qat_health
+    tensors = {
+        name: dict(values) for name, values in sorted(health_metrics.items())
+        if "group_count" in values
+    }
+    if not tensors:
+        raise ValueError("TQ1 health record contains no TQ1 tensors")
+    def numeric(values: Mapping[str, Any], name: str) -> dict[str, int | float]:
+        result = {}
+        for key, value in values.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if not math.isfinite(float(value)):
+                raise ValueError(f"TQ1 {name} metric {key!r} is nonfinite")
+            result[key] = value
+        return result
+
+    numeric_model = numeric(model_metrics or {}, "model")
+    numeric_training = numeric(training_metrics or {}, "training")
+    return {
+        "schema": 1,
+        "event": event,
+        "step": int(step),
+        "tokens": int(tokens),
+        "quant_spec_sha256": quant_spec_sha256,
+        "model_metrics": numeric_model,
+        "training_metrics": numeric_training,
+        "controller": dict(controller or {}),
+        "aggregate": aggregate_qat_health(tensors),
+        "tensors": tensors,
+    }
+
+
+def tq1_hidden_layers(config: Mapping[str, Any]) -> tuple[int, ...]:
+    raw = config.get("hidden_layers", ())
+    if not isinstance(raw, (list, tuple)) or any(
+            isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
+            for layer in raw) or len(set(raw)) != len(raw):
+        raise ValueError("TQ1 hidden_layers must be unique nonnegative integers")
+    weight = config.get("lambda_hidden", 0.0)
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)) \
+            or not math.isfinite(float(weight)) or float(weight) < 0:
+        raise ValueError("TQ1 lambda_hidden must be finite and nonnegative")
+    return tuple(raw)
+
+
+def append_jsonl(path: str | Path, record: Mapping[str, Any]) -> None:
+    try:
+        rendered = json.dumps(
+            record, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("JSONL record is not finite standards-compliant JSON") from exc
+    with Path(path).open("a", encoding="utf-8") as handle:
+        handle.write(rendered + "\n")
+
+
+@torch.no_grad()
+def tq1_hidden_alignment(raw_model, teacher, windows, device,
+                         hidden_layers: tuple[int, ...]) -> dict[str, float]:
+    """Normalized hidden MSE on the fixed calibration windows."""
+    if not hidden_layers:
+        return {}
+    if len(set(hidden_layers)) != len(hidden_layers) or any(
+            isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
+            for layer in hidden_layers):
+        raise ValueError("TQ1 hidden layers must be unique nonnegative integers")
+    student_base = getattr(raw_model, "model", None)
+    if student_base is None:
+        raise ValueError("TQ1 hidden evaluation requires a decoder at model.model")
+    ids_windows, masks = windows if isinstance(windows, (tuple, list)) else (windows, None)
+    totals = {layer: 0.0 for layer in hidden_layers}
+    counts = {layer: 0 for layer in hidden_layers}
+    for index in range(ids_windows.shape[0]):
+        ids = ids_windows[index:index + 1].to(device)
+        output = student_base(ids, output_hidden_states=True, use_cache=False)
+        if output.hidden_states is None:
+            raise ValueError("student decoder did not return hidden states")
+        served = teacher.slice_server(ids, hidden_layers=hidden_layers)
+        if not isinstance(served, tuple) or len(served) != 2:
+            raise ValueError("teacher did not return requested hidden states")
+        _, teacher_hidden = served
+        prediction_mask = (None if masks is None else
+                           masks[index:index + 1, 1:].to(device).bool())
+        for layer in hidden_layers:
+            if layer >= len(output.hidden_states) or layer not in teacher_hidden:
+                raise ValueError(f"hidden layer {layer} is unavailable")
+            student_value = output.hidden_states[layer][:, :-1].float()
+            teacher_value = teacher_hidden[layer].to(device).float()
+            if student_value.shape != teacher_value.shape:
+                raise ValueError(f"hidden layer {layer} shape mismatch")
+            per_token = (
+                torch.nn.functional.normalize(student_value, dim=-1)
+                - torch.nn.functional.normalize(teacher_value, dim=-1)
+            ).square().mean(-1)
+            if prediction_mask is not None:
+                per_token = per_token[prediction_mask]
+            totals[layer] += float(per_token.sum())
+            counts[layer] += per_token.numel()
+    if any(count == 0 for count in counts.values()):
+        raise ValueError("fixed calibration hidden evaluation retained no tokens")
+    by_layer = {
+        f"hidden_normalized_mse_L{layer}": totals[layer] / counts[layer]
+        for layer in hidden_layers
+    }
+    return {
+        "hidden_normalized_mse": sum(by_layer.values()) / len(by_layer),
+        **by_layer,
+    }
+
+
+def tq1_hidden_loss(student_hidden, teacher_hidden: Mapping[int, torch.Tensor],
+                    hidden_layers: tuple[int, ...],
+                    prediction_mask: torch.Tensor | None) -> torch.Tensor:
+    """Exact configured-layer normalized MSE for the live training batch."""
+    if not hidden_layers:
+        raise ValueError("TQ1 hidden loss requires at least one configured layer")
+    if len(set(hidden_layers)) != len(hidden_layers) or any(
+            isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
+            for layer in hidden_layers):
+        raise ValueError("TQ1 hidden layers must be unique nonnegative integers")
+    if set(teacher_hidden) != set(hidden_layers):
+        missing = sorted(set(hidden_layers) - set(teacher_hidden))
+        extra = sorted(set(teacher_hidden) - set(hidden_layers))
+        raise ValueError(
+            f"teacher hidden-layer inventory mismatch: missing={missing}, extra={extra}")
+    losses = []
+    for layer in hidden_layers:
+        if layer < 0 or layer >= len(student_hidden):
+            raise ValueError(f"student hidden layer {layer} is unavailable")
+        student_value = student_hidden[layer][:, :-1]
+        teacher_value = teacher_hidden[layer].to(student_value.device)
+        if student_value.shape != teacher_value.shape:
+            raise ValueError(f"hidden layer {layer} shape mismatch")
+        student_norm = torch.nn.functional.normalize(student_value.float(), dim=-1)
+        teacher_norm = torch.nn.functional.normalize(teacher_value.float(), dim=-1)
+        per_token = (student_norm - teacher_norm).square().mean(-1)
+        if prediction_mask is not None:
+            if prediction_mask.shape != per_token.shape:
+                raise ValueError("hidden-loss prediction mask shape mismatch")
+            per_token = per_token[prediction_mask]
+        if per_token.numel() == 0:
+            raise ValueError("TQ1 hidden loss retained no prediction tokens")
+        value = per_token.mean()
+        if not torch.isfinite(value):
+            raise ValueError(f"hidden layer {layer} loss is nonfinite")
+        losses.append(value)
+    return torch.stack(losses).mean()
 
 
 # --------------------------------------------------------------------------- health
@@ -423,11 +580,13 @@ def main(argv=None):
     total_steps = max(1, math.ceil(requested_tokens / tokens_per_step))
     total_tokens = total_steps * tokens_per_step
     tq1_schedule = None
+    configured_hidden_layers: tuple[int, ...] = ()
     if profile.quant_scheme == "tq1_v":
         from bitnet_train.tq1.curriculum import schedule_from_config
         tq1_schedule = schedule_from_config(profile.quant)
         tq1_schedule.validate_run(total_tokens=total_tokens,
                                   tokens_per_step=tokens_per_step)
+        configured_hidden_layers = tq1_hidden_layers(profile.quant)
 
     ckpt = args.resume or args.init
     latent_dtype = torch.bfloat16 if args.latent_dtype == "bf16" else torch.float32
@@ -501,6 +660,11 @@ def main(argv=None):
         if not args.topk_cache:
             raise SystemExit("--kd topk requires --topk-cache (distill.build_topk_cache)")
         cache_reader = TopkCacheReader(args.topk_cache, args.data_dir, tau=args.kd_tau)
+    if profile.quant_scheme == "tq1_v" \
+            and configured_hidden_layers \
+            and float(profile.quant.get("lambda_hidden", 0.0)) > 0 \
+            and teacher is None:
+        raise ValueError("TQ1 hidden distillation requires --kd dense with a live teacher")
 
     # ---- provenance meta (§5.6, binding)
     tq1_meta = None
@@ -570,6 +734,7 @@ def main(argv=None):
     run_dir = os.path.join(args.out_dir, args.run_name)
     os.makedirs(run_dir, exist_ok=True)
     log_path = os.path.join(run_dir, "metrics.jsonl")
+    tq1_health_path = os.path.join(run_dir, "tq1_health.jsonl")
     if args.wandb:
         try:
             accelerator.init_trackers(args.wandb_project,
@@ -634,6 +799,22 @@ def main(argv=None):
                     for name, value in code_snapshot.items()):
                 raise RuntimeError("TQ1 checkpoint freeze-gate snapshot inventory mismatch")
             code_flip_rates(gate_code_snapshot, code_snapshot)
+        if start_step == 0:
+            initial_eval = run_eval(
+                model, raw_model, profile, calib, accelerator, teacher,
+                args, is_moe, router_hooks, train_mode, teacher_routing)
+            initial_health = ternary_health(raw_model, code_snapshot)
+            if accelerator.is_main_process:
+                append_jsonl(tq1_health_path, tq1_health_record(
+                    initial_health, event="token_zero", step=0, tokens=0,
+                    quant_spec_sha256=tq1_controller.modules[0].quant_spec_sha256,
+                    model_metrics=initial_eval,
+                    controller=tq1_controller.status()))
+            # Make the interval baseline exactly the codes described by the
+            # token-zero record, even if evaluation populated a lazy projection.
+            code_snapshot = snapshot_codes(raw_model)
+            gate_code_snapshot = {
+                name: value.clone() for name, value in code_snapshot.items()}
     t0, tokens0 = time.time(), tokens_seen
     model.train()
 
@@ -657,8 +838,7 @@ def main(argv=None):
         flat_mask = None if prediction_mask is None else prediction_mask.reshape(-1)
         teacher_batch = None
         teacher_hidden = {}
-        hidden_layers = tuple(int(layer) for layer in profile.quant.get("hidden_layers", ())) \
-            if profile.quant_scheme == "tq1_v" else ()
+        hidden_layers = configured_hidden_layers
         if args.kd == "dense":
             served = teacher.slice_server(ids, hidden_layers=hidden_layers)
             if hidden_layers:
@@ -673,24 +853,12 @@ def main(argv=None):
                               loss_mask=flat_mask)
         loss = parts["loss"]
         hidden_value = margin_value = 0.0
-        if hidden_layers and teacher_hidden:
-            hidden_losses = []
-            for layer, teacher_value in teacher_hidden.items():
-                if layer >= len(out.hidden_states):
-                    continue
-                student_value = out.hidden_states[layer][:, :-1]
-                student_norm = torch.nn.functional.normalize(student_value.float(), dim=-1)
-                teacher_norm = torch.nn.functional.normalize(
-                    teacher_value.to(student_value.device).float(), dim=-1)
-                per_token = (student_norm - teacher_norm).square().mean(-1)
-                if prediction_mask is not None:
-                    per_token = per_token[prediction_mask]
-                hidden_losses.append(per_token.mean())
-            if hidden_losses:
-                hidden_loss = torch.stack(hidden_losses).mean()
-                hidden_weight = float(profile.quant.get("lambda_hidden", 0.05))
-                loss = loss + hidden_weight * hidden_loss
-                hidden_value = float(hidden_loss.detach())
+        if hidden_layers:
+            hidden_loss = tq1_hidden_loss(
+                out.hidden_states, teacher_hidden, hidden_layers, prediction_mask)
+            hidden_weight = float(profile.quant.get("lambda_hidden", 0.05))
+            loss = loss + hidden_weight * hidden_loss
+            hidden_value = float(hidden_loss.detach())
         if profile.quant_scheme == "tq1_v":
             from bitnet_train.tq1.qat import iter_tq1linears
             margin_weight = float(profile.quant.get("lambda_margin", 0.01))
@@ -786,18 +954,37 @@ def main(argv=None):
                 or gate_observation):
             ev = run_eval(model, raw_model, profile, calib, accelerator, teacher,
                           args, is_moe, router_hooks, train_mode, teacher_routing)
+            previous_snapshot = code_snapshot
             new_snap = snapshot_codes(raw_model)
-            flips = code_flip_rates(code_snapshot, new_snap)
+            flips = code_flip_rates(previous_snapshot, new_snap)
             code_snapshot = new_snap
             ev["flip_total"] = flips["_total"]
-            th = ternary_health(raw_model)
+            th = ternary_health(raw_model, previous_snapshot)
             ev["zero_frac_mean"] = sum(v["frac_zero"] for v in th.values()) / len(th)
             ev["zero_frac_max"] = max(v["frac_zero"] for v in th.values())
             ev["quant_rel_err_mean"] = (sum(v["quant_rel_err"] for v in th.values())
                                         / len(th))
-            tq1_health = [value for value in th.values() if "margin_p05" in value]
-            if tq1_health:
-                ev["tq1_margin_p05"] = min(value["margin_p05"] for value in tq1_health)
+            tq1_tensors = {
+                name: value for name, value in th.items() if "group_count" in value}
+            tq1_aggregate = None
+            if tq1_tensors:
+                from bitnet_train.tq1.qat import aggregate_qat_health
+                tq1_aggregate = aggregate_qat_health(tq1_tensors)
+                ev["tq1_margin_p05"] = tq1_aggregate["margin_p05"]
+                ev["tq1_changed_trits_mean"] = \
+                    tq1_aggregate["mean_changed_trits_per_group"]
+                ev["tq1_scalar_exact_hit_rate"] = \
+                    tq1_aggregate["scalar_pattern_exact_hit_rate"]
+                ev["tq1_codebook_entropy"] = \
+                    tq1_aggregate["codebook_entropy_tensor_weighted"]
+                ev["tq1_weighted_projection_relative_error"] = \
+                    tq1_aggregate["weighted_projection_relative_error"]
+                ev["tq1_scale_underflow_count"] = \
+                    tq1_aggregate["scale_underflow_count"]
+                ev["tq1_zero_fraction_max"] = max(
+                    float(value["frac_zero"]) for value in tq1_tensors.values())
+                ev["tq1_newly_activated_codewords"] = \
+                    tq1_aggregate["newly_activated_codewords"]
             controller_event = None
             if tq1_controller is not None:
                 if gate_observation:
@@ -814,6 +1001,14 @@ def main(argv=None):
                 ev["tq1_export_qualified"] = float(controller_event["export_qualified"])
                 ev["tq1_gate_observation"] = float(gate_observation)
             if accelerator.is_main_process:
+                if tq1_controller is not None:
+                    append_jsonl(tq1_health_path, tq1_health_record(
+                        th,
+                        event=("gate_evaluation" if gate_observation else "evaluation"),
+                        step=step + 1, tokens=tokens_seen,
+                        quant_spec_sha256=tq1_controller.modules[0].quant_spec_sha256,
+                        model_metrics=ev, training_metrics=step_metrics,
+                        controller=controller_event))
                 if controller_event is not None and controller_event["transitioned"]:
                     say(f"step {step + 1} ({tokens_seen:,} tokens): "
                         "TQ1 indices passed freeze gates and are frozen")
@@ -905,6 +1100,10 @@ def run_eval(model, raw_model, profile, calib, accelerator, teacher, args, is_mo
     if teacher is not None:
         set_eval_mode(raw_model, train_mode)
         ev["kl_tf"] = kl_tf(raw_model, teacher.model, calib, device, tau=1.0)
+        if profile.quant_scheme == "tq1_v":
+            hidden_layers = tq1_hidden_layers(profile.quant)
+            ev.update(tq1_hidden_alignment(
+                raw_model, teacher, calib, device, hidden_layers))
     set_eval_mode(raw_model, train_mode)
     if router_hooks is not None:
         router_hooks.stats_and_reset()                            # drop eval-pass stats

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from bitnet_train.conversion import ArchProfile, build_param_groups, convert
@@ -33,7 +34,8 @@ def test_profile_driven_tq1_conversion_uses_canonical_artifact(tmp_path):
                r"model\.layers\.\d+\.mlp\.(gate|up|down)_proj")
     book = _book()
     spec = QuantSpec.core(default_profile="tq1_v11-j-r", codebook=book.ref(),
-                          target_regexes=targets, keep_fp_regexes=("lm_head",))
+                          target_regexes=targets, keep_fp_regexes=("lm_head",),
+                          importance_mode="uniform")
     registry = CodebookRegistry({book.id: book})
     builder = ArtifactBuilder(
         spec, registry, source_model="tiny", source_revision="a" * 40,
@@ -72,6 +74,12 @@ def test_profile_driven_tq1_conversion_uses_canonical_artifact(tmp_path):
             "qat_projection": "hard", "top_m": 4,
         },
     )
+    mismatched = ArchProfile(
+        name="bad_tq1", base_model="tiny", teacher="tiny",
+        target_linear_regexes=list(targets), keep_fp_regexes=["lm_head"],
+        quant={**profile.quant, "candidate_count": spec.candidate_count + 1})
+    with pytest.raises(ValueError, match="candidate_count differs"):
+        convert(model, mismatched, tq1_artifact=artifact)
     report = convert(model, profile, tq1_artifact=artifact)
     assert report.n_ternarized == 7
     assert sum(isinstance(module, TQ1Linear) for module in model.modules()) == 7

@@ -50,7 +50,7 @@ def test_frozen_qat_export_is_index_and_scale_exact(tmp_path):
     builder.write(source, source_files=source_files, quantization_report={})
 
     module = TQ1Linear(
-        torch.zeros(2, 256), scales, book, spec, profile="tq1_v11-j-r",
+        torch.full((2, 256), 0.01), scales, book, spec, profile="tq1_v11-j-r",
         initial_indices=indices, phase="hard", top_m=4)
     module.freeze_indices()
     model = _Model(module)

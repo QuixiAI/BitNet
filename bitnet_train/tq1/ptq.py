@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import resource
+import sys
 import time
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -39,6 +41,24 @@ class Importance:
         for tensor in (self.diag, self.cov8, self.cov256):
             if tensor is not None and not torch.isfinite(tensor).all():
                 raise ValueError("importance statistics contain NaN or infinity")
+        if self.cov8 is not None:
+            covariance = self.cov8.detach().float().cpu()
+            if not torch.allclose(
+                    covariance, covariance.transpose(-1, -2),
+                    atol=1e-6, rtol=1e-6):
+                raise ValueError("covariance8 importance is not symmetric")
+            minimum = float(torch.linalg.eigvalsh(covariance).min())
+            if minimum < -1e-6:
+                raise ValueError(
+                    f"covariance8 importance is not positive semidefinite (min={minimum})")
+        if self.cov256 is not None:
+            covariance = self.cov256.detach().float().cpu()
+            if not torch.allclose(
+                    covariance, covariance.transpose(-1, -2),
+                    atol=1e-6, rtol=1e-6):
+                raise ValueError("block256 importance is not symmetric")
+            if torch.any(covariance.diagonal(dim1=-2, dim2=-1) < 0):
+                raise ValueError("block256 importance has a negative diagonal")
 
 
 @dataclass(frozen=True)
@@ -124,6 +144,18 @@ def _rounded_scale(value: float | torch.Tensor, dtype: torch.dtype, *, nonzero: 
     return float(torch.tensor(max(number, torch.finfo(dtype).tiny), dtype=dtype).float())
 
 
+def _scale_underflows(value: float | torch.Tensor, dtype: torch.dtype) -> bool:
+    number = float(value)
+    return 0 < number < torch.finfo(dtype).tiny
+
+
+def _process_peak_rss_bytes() -> int:
+    """Return the process high-water RSS using the platform's ru_maxrss units."""
+    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    # Darwin reports bytes; Linux and the other supported Unix CI hosts report KiB.
+    return value if sys.platform == "darwin" else value * 1024
+
+
 def _metric_for_row(weight: torch.Tensor, importance: Importance, weight_metric: str) \
         -> tuple[torch.Tensor | None, torch.Tensor | None]:
     width = weight.numel()
@@ -179,6 +211,9 @@ def _assign_groups(target: torch.Tensor, scale: float, codebook: Codebook,
             target.shape[0], -1)
     else:
         choices = candidate_table(codebook, config.candidate_count)[base3_ids(initializer)]
+    # Candidate-table shell order determines membership only. The objective's
+    # normative tie break is the lowest legal numerical index.
+    choices = torch.sort(choices, dim=1).values
     result_indices = torch.empty(target.shape[0], dtype=torch.int64)
     result_decoded = torch.empty_like(target)
     result_errors = torch.empty(target.shape[0], dtype=torch.float32)
@@ -206,6 +241,7 @@ def _assign_a4(target: torch.Tensor, scale: float, codebook: Codebook,
             target.shape[0], -1)
     else:
         choices = candidate_table(codebook, config.candidate_count)[base3_ids(initializer)]
+    choices = torch.sort(choices, dim=1).values
     rho = torch.tensor([6 / 8, 7 / 8, 1.0, 9 / 8], dtype=torch.float32)
     mu = torch.tensor([0.0, 1 / 8, -1 / 8], dtype=torch.float32)
     out_indices = torch.empty(target.shape[0], dtype=torch.int64)
@@ -286,101 +322,175 @@ def _full_block_refit(weight: torch.Tensor, decoded: torch.Tensor,
     return float(numerator / denominator)
 
 
-def _gptq_sweep(weight: torch.Tensor, covariance: torch.Tensor, scale: float,
-                codebook: Codebook, config: PTQConfig) -> tuple[torch.Tensor, int]:
+def _prepare_gptq_metric(covariance: torch.Tensor, config: PTQConfig) \
+        -> tuple[torch.Tensor, list[list[torch.Tensor]], dict[str, Any]]:
+    if covariance.ndim != 3 or tuple(covariance.shape[1:]) != (256, 256):
+        raise ValueError("GPTQ covariance must be [blocks,256,256]")
+    if not torch.isfinite(covariance).all() or not torch.allclose(
+            covariance, covariance.transpose(-1, -2), atol=1e-6, rtol=1e-6):
+        raise ValueError("GPTQ covariance is nonfinite or nonsymmetric")
+    prepared = covariance.detach().float().cpu().clone()
+    transfers: list[list[torch.Tensor]] = []
+    damping_values: list[float] = []
+    failure_locations: list[dict[str, int | str]] = []
+    fallback_blocks: list[int] = []
+    eye = torch.eye(256)
+    for block in range(prepared.shape[0]):
+        damping = config.gptq_damping * float(prepared[block].diagonal().mean())
+        if not math.isfinite(damping) or damping < 0:
+            raise ValueError(f"GPTQ damping is invalid for block {block}")
+        damping_values.append(damping)
+        prepared[block] += eye * damping
+
+        failure: dict[str, int | str] | None = None
+        _, info = torch.linalg.cholesky_ex(prepared[block], check_errors=False)
+        if int(info):
+            failure = {"block": block, "stage": "block", "info": int(info)}
+        else:
+            for group in range(32):
+                begin, end = group * 8, group * 8 + 8
+                _, info = torch.linalg.cholesky_ex(
+                    prepared[block, begin:end, begin:end], check_errors=False)
+                if int(info):
+                    failure = {
+                        "block": block, "group": group,
+                        "stage": "group", "info": int(info),
+                    }
+                    break
+        if failure is not None:
+            failure_locations.append(failure)
+            if not config.allow_diagonal_fallback:
+                position = (f"block {block}" if failure["stage"] == "block" else
+                            f"block {block}, group {failure['group']}")
+                raise ValueError(f"GPTQ Cholesky failed for {position}")
+            fallback_blocks.append(block)
+            prepared[block] = torch.diag(
+                prepared[block].diagonal().clamp_min(1e-12))
+
+        block_transfers = []
+        for group in range(32):
+            begin, end = group * 8, group * 8 + 8
+            if end == 256:
+                block_transfers.append(torch.empty((8, 0), dtype=torch.float32))
+                continue
+            hgg = prepared[block, begin:end, begin:end]
+            factor = torch.linalg.cholesky(hgg)
+            block_transfers.append(torch.cholesky_solve(
+                prepared[block, begin:end, end:], factor))
+        transfers.append(block_transfers)
+    return prepared, transfers, {
+        "group_order": "increasing_k",
+        "block_size": 256,
+        "damping_factor": config.gptq_damping,
+        "block_damping_values": damping_values,
+        "factorization_failures": len(failure_locations),
+        "factorization_failure_locations": failure_locations,
+        "factorization_fallbacks": len(fallback_blocks),
+        "diagonal_fallback_blocks": fallback_blocks,
+    }
+
+
+def _gptq_sweep(weight: torch.Tensor, covariance: torch.Tensor,
+                transfers: list[list[torch.Tensor]], scale: float,
+                codebook: Codebook, config: PTQConfig) -> torch.Tensor:
     """One deterministic increasing-K feedback sweep at an exact runtime scale."""
     blocks = weight.reshape(-1, 256)
+    if len(transfers) != blocks.shape[0]:
+        raise ValueError("GPTQ transfer inventory differs from the weight blocks")
     indices = torch.empty((blocks.shape[0], 32), dtype=torch.int64)
-    fallbacks = 0
     for block in range(blocks.shape[0]):
-        h = covariance[block].clone()
-        damping = config.gptq_damping * float(h.diagonal().mean())
-        h += torch.eye(256) * damping
-        try:
-            torch.linalg.cholesky(h)
-        except torch.linalg.LinAlgError:
-            if not config.allow_diagonal_fallback:
-                raise ValueError(f"GPTQ Cholesky failed for block {block}")
-            fallbacks += 1
-            h = torch.diag(torch.diagonal(h).clamp_min(1e-12))
         target = blocks[block].clone()
         for group in range(32):
             begin, end = group * 8, group * 8 + 8
-            hgg = h[begin:end, begin:end]
+            hgg = covariance[block, begin:end, begin:end]
             diag = hgg.diagonal()[None]
             chosen, decoded, _ = _assign_groups(
                 target[begin:end][None], scale, codebook, diag, hgg[None], config)
             indices[block, group] = chosen[0]
             if end < 256:
                 error = target[begin:end] - scale * decoded[0]
-                try:
-                    transfer = torch.linalg.solve(hgg, h[begin:end, end:])
-                except torch.linalg.LinAlgError:
-                    if not config.allow_diagonal_fallback:
-                        raise ValueError(f"GPTQ group solve failed at block {block}, group {group}")
-                    fallbacks += 1
-                    transfer = h[begin:end, end:] / hgg.diagonal().clamp_min(1e-12)[:, None]
-                target[end:] -= error @ transfer
-    return indices.reshape(-1), fallbacks
+                target[end:] -= error @ transfers[block][group]
+    return indices.reshape(-1)
 
 
 def _apply_gptq(weight: torch.Tensor, covariance: torch.Tensor, ordinary_scale: float,
-                ordinary_indices: torch.Tensor, codebook: Codebook, config: PTQConfig) \
+                ordinary_source_scale: float, ordinary_indices: torch.Tensor,
+                codebook: Codebook, config: PTQConfig) \
         -> tuple[float, torch.Tensor, dict[str, Any]]:
+    covariance, transfers, factorization_report = _prepare_gptq_metric(
+        covariance, config)
     ordinary_decoded = codebook.decode(ordinary_indices).float()
-    candidates: list[tuple[float, int, float, torch.Tensor]] = [(
+    candidates: list[tuple[float, int, float, float, torch.Tensor]] = [(
         _full_block_objective(weight, ordinary_decoded, ordinary_scale, covariance),
-        0, ordinary_scale, ordinary_indices,
+        0, ordinary_scale, ordinary_source_scale, ordinary_indices,
     )]
     sweep_scales = [ordinary_scale]
-    fallbacks = 0
-    first_indices, count = _gptq_sweep(weight, covariance, ordinary_scale, codebook, config)
-    fallbacks += count
+    underflow_events = 0
+    first_indices = _gptq_sweep(
+        weight, covariance, transfers, ordinary_scale, codebook, config)
     first_decoded = codebook.decode(first_indices).float()
     refit = _full_block_refit(weight, first_decoded, covariance)
     if refit is not None:
+        underflow_events += int(_scale_underflows(refit, config.scale_dtype))
         first_scale = _rounded_scale(refit, config.scale_dtype, nonzero=True)
         candidates.append((_full_block_objective(weight, first_decoded, first_scale, covariance),
-                           1, first_scale, first_indices))
+                           1, first_scale, refit, first_indices))
         sweep_scales.append(first_scale)
         if first_scale != ordinary_scale:
-            second_indices, count = _gptq_sweep(
-                weight, covariance, first_scale, codebook, config)
-            fallbacks += count
+            second_indices = _gptq_sweep(
+                weight, covariance, transfers, first_scale, codebook, config)
             second_decoded = codebook.decode(second_indices).float()
             second_refit = _full_block_refit(weight, second_decoded, covariance)
-            second_scale = (_rounded_scale(second_refit, config.scale_dtype, nonzero=True)
-                            if second_refit is not None else first_scale)
+            if second_refit is not None:
+                underflow_events += int(_scale_underflows(second_refit, config.scale_dtype))
+            second_source_scale = second_refit if second_refit is not None else refit
+            second_scale = (_rounded_scale(second_source_scale, config.scale_dtype,
+                                           nonzero=True))
             candidates.append((
                 _full_block_objective(weight, second_decoded, second_scale, covariance),
-                2, second_scale, second_indices,
+                2, second_scale, second_source_scale, second_indices,
             ))
             sweep_scales.append(second_scale)
     # Objective, then candidate zero, then earliest sweep.
     best = min(candidates, key=lambda item: (item[0], item[1]))
-    return best[2], best[3], {
+    return best[2], best[4], {
         "ordinary_objective": candidates[0][0],
         "selected_objective": best[0],
         "selected_candidate": best[1],
+        "selected_source_scale": best[3],
+        "selected_scale_underflow": _scale_underflows(best[3], config.scale_dtype),
+        "rounding_underflow_events": underflow_events,
         "sweep_scales": sweep_scales,
-        "factorization_fallbacks": fallbacks,
+        **factorization_report,
     }
 
 
 def _solve_unit(weight: torch.Tensor, diag: torch.Tensor, cov: torch.Tensor | None,
                 codebook: Codebook, config: PTQConfig) \
-        -> tuple[float, torch.Tensor, torch.Tensor | None, list[float], int]:
+        -> tuple[float, torch.Tensor, torch.Tensor | None, list[float], dict[str, Any]]:
     nonzero = bool(torch.any(weight != 0))
     if not nonzero:
         zero = torch.nonzero((codebook.decode(torch.arange(codebook.index_count)) == 0)
                              .all(-1) & codebook.legal_index_mask()).flatten()[0]
         return 0.0, torch.full((weight.shape[0],), int(zero), dtype=torch.int64), \
             (torch.zeros(weight.shape[0] // 4, dtype=torch.uint8)
-             if "-a4-" in config.profile else None), [0.0], 0
+             if "-a4-" in config.profile else None), [0.0], {
+                 "source_scale": 0.0,
+                 "selected_scale_underflow": False,
+                 "rounding_underflow_events": 0,
+                 "rejected_refits": 0,
+             }
+    underflow_events = 0
+
+    def rounded(value: float) -> float:
+        nonlocal underflow_events
+        underflow_events += int(_scale_underflows(value, config.scale_dtype))
+        return _rounded_scale(value, config.scale_dtype, nonzero=True)
+
     flat_diag = diag.reshape(-1)
-    alpha = float((flat_diag * weight.abs().reshape(-1)).sum()
-                  / flat_diag.sum().clamp_min(1e-30))
-    alpha = _rounded_scale(alpha, config.scale_dtype, nonzero=True)
+    source_alpha = float((flat_diag * weight.abs().reshape(-1)).sum()
+                         / flat_diag.sum().clamp_min(1e-30))
+    alpha = rounded(source_alpha)
     trace = []
     rejected = 0
     indices = affine = None
@@ -395,7 +505,8 @@ def _solve_unit(weight: torch.Tensor, diag: torch.Tensor, cov: torch.Tensor | No
         if candidate is None:
             rejected += 1
         else:
-            alpha = _rounded_scale(candidate, config.scale_dtype, nonzero=True)
+            source_alpha = candidate
+            alpha = rounded(candidate)
     assert indices is not None and decoded is not None
     # Required final rounded-scale comparison.
     candidates = []
@@ -404,31 +515,48 @@ def _solve_unit(weight: torch.Tensor, diag: torch.Tensor, cov: torch.Tensor | No
     else:
         idx_a, dec_a, _ = _assign_groups(weight, alpha, codebook, diag, cov, config)
         aff_a = None
-    candidates.append((_objective(weight, dec_a, alpha, diag, cov), alpha, idx_a, aff_a, dec_a))
+    candidates.append((_objective(weight, dec_a, alpha, diag, cov), 0, alpha,
+                       source_alpha, idx_a, aff_a, dec_a))
     refit = _refit(weight, dec_a, diag, cov)
     if refit is not None:
-        alpha_b = _rounded_scale(refit, config.scale_dtype, nonzero=True)
-        if "-a4-" in config.profile:
-            idx_b, dec_b, _, aff_b = _assign_a4(weight, alpha_b, codebook, diag, cov, config)
+        alpha_b = rounded(refit)
+        if alpha_b == alpha:
+            # The analytic source changed but its exact runtime representation did not.
+            objective, ordinal, runtime, _, idx_a, aff_a, dec_a = candidates[0]
+            candidates[0] = (objective, ordinal, runtime, refit, idx_a, aff_a, dec_a)
         else:
-            idx_b, dec_b, _ = _assign_groups(weight, alpha_b, codebook, diag, cov, config)
-            aff_b = None
-        candidates.append((_objective(weight, dec_b, alpha_b, diag, cov),
-                           alpha_b, idx_b, aff_b, dec_b))
-    candidates.sort(key=lambda item: item[0])
-    best = candidates[0]
+            if "-a4-" in config.profile:
+                idx_b, dec_b, _, aff_b = _assign_a4(
+                    weight, alpha_b, codebook, diag, cov, config)
+            else:
+                idx_b, dec_b, _ = _assign_groups(
+                    weight, alpha_b, codebook, diag, cov, config)
+                aff_b = None
+            candidates.append((_objective(weight, dec_b, alpha_b, diag, cov), 1,
+                               alpha_b, refit, idx_b, aff_b, dec_b))
+    best = min(candidates, key=lambda item: (item[0], item[1]))
     trace.append(best[0])
-    if best[1] <= 0:
+    if best[2] <= 0:
         raise ValueError("nonzero scale unit has no valid positive rounded refit")
-    return best[1], best[2], best[3], trace, rejected
+    return best[2], best[4], best[5], trace, {
+        "source_scale": best[3],
+        "selected_scale_underflow": _scale_underflows(best[3], config.scale_dtype),
+        "rounding_underflow_events": underflow_events,
+        "rejected_refits": rejected,
+    }
 
 
 def project_weight(weight: torch.Tensor, codebook: Codebook, importance: Importance,
                    config: PTQConfig) -> PTQResult:
     """Project a latent [N,K] matrix directly into its declared TQ1 profile."""
     config.validate()
+    started = time.perf_counter()
+    peak_memory_baseline = _process_peak_rss_bytes()
+    if weight.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError("PTQ source dtype must be float16, bfloat16, or float32")
     source = weight.detach().float().cpu()
-    if source.ndim != 2 or source.shape[1] % 256:
+    if source.ndim != 2 or source.shape[0] < 1 or source.shape[1] < 256 \
+            or source.shape[1] % 256:
         raise ValueError("PTQ source must be [N,K] with K divisible by 256")
     if not torch.isfinite(source).all():
         raise ValueError("PTQ source contains NaN or infinity")
@@ -438,7 +566,6 @@ def project_weight(weight: torch.Tensor, codebook: Codebook, importance: Importa
         "product" if "-p-" in config.profile else "sign_canonical"
     if codebook.index_bits != spec.index_bits or codebook.encoding != expected_encoding:
         raise ValueError("PTQ codebook is incompatible with the requested profile")
-    started = time.perf_counter()
     rows, width = source.shape
     indices = torch.empty((rows, width // 8), dtype=torch.int64)
     row_scales = torch.empty(rows, dtype=config.scale_dtype) if spec.scale_mode == "row" else None
@@ -447,42 +574,62 @@ def project_weight(weight: torch.Tensor, codebook: Codebook, importance: Importa
     affine = (torch.empty((rows, width // 32), dtype=torch.uint8) if spec.affine else None)
     traces: list[list[float]] = []
     gptq_reports: list[dict[str, Any]] = []
-    rejected_refits = zero_rows = 0
+    source_scales: list[float] = []
+    rounded_scales: list[float] = []
+    rejected_refits = underflow_count = rounding_underflow_events = 0
+    zero_rows = int((source == 0).all(dim=1).sum())
     for row in range(rows):
         diag, cov = _metric_for_row(source[row], importance, config.weight_metric)
         groups = source[row].reshape(-1, 8)
         if spec.scale_mode == "row":
-            scale, idx, aff, trace, rejected = _solve_unit(
+            scale, idx, aff, trace, solve_report = _solve_unit(
                 groups, diag, cov, codebook, config)
+            source_scale = float(solve_report["source_scale"])
             if config.gptq_feedback:
                 effective_cov = _effective_cov256(source[row], importance,
                                                    config.weight_metric)
                 scale, idx, gptq_report = _apply_gptq(
-                    groups, effective_cov, scale, idx, codebook, config)
+                    groups, effective_cov, scale, source_scale, idx, codebook, config)
                 gptq_reports.append({"row": row, **gptq_report})
+                source_scale = float(gptq_report["selected_source_scale"])
+                rounding_underflow_events += int(
+                    gptq_report["rounding_underflow_events"])
             row_scales[row] = scale
             indices[row] = idx
             if affine is not None and aff is not None:
                 affine[row] = aff
-            zero_rows += int(scale == 0)
-            rejected_refits += rejected
+            source_scales.append(source_scale)
+            rounded_scales.append(scale)
+            underflow_count += int(_scale_underflows(source_scale, config.scale_dtype))
+            rounding_underflow_events += int(solve_report["rounding_underflow_events"])
+            rejected_refits += int(solve_report["rejected_refits"])
             traces.append(trace)
         else:
             row_trace = []
             for block in range(width // 256):
                 group_slice = slice(block * 32, (block + 1) * 32)
-                scale, idx, _, trace, rejected = _solve_unit(
+                scale, idx, _, trace, solve_report = _solve_unit(
                     groups[group_slice], diag[group_slice],
                     None if cov is None else cov[group_slice], codebook, config)
+                source_scale = float(solve_report["source_scale"])
                 if config.gptq_feedback:
                     effective_cov = _effective_cov256(source[row], importance,
                                                        config.weight_metric)[block:block + 1]
                     scale, idx, gptq_report = _apply_gptq(
-                        groups[group_slice], effective_cov, scale, idx, codebook, config)
+                        groups[group_slice], effective_cov, scale, source_scale,
+                        idx, codebook, config)
                     gptq_reports.append({"row": row, "block": block, **gptq_report})
+                    source_scale = float(gptq_report["selected_source_scale"])
+                    rounding_underflow_events += int(
+                        gptq_report["rounding_underflow_events"])
                 block_scales[row, block] = scale
                 indices[row, group_slice] = idx
-                rejected_refits += rejected
+                source_scales.append(source_scale)
+                rounded_scales.append(scale)
+                underflow_count += int(_scale_underflows(source_scale, config.scale_dtype))
+                rounding_underflow_events += int(
+                    solve_report["rounding_underflow_events"])
+                rejected_refits += int(solve_report["rejected_refits"])
                 row_trace.extend(trace)
             traces.append(row_trace)
     affine_blocks = affine.reshape(rows, width // 256, 8) if affine is not None else None
@@ -492,9 +639,9 @@ def project_weight(weight: torch.Tensor, codebook: Codebook, importance: Importa
                                     row_scales=row_scales)
     delta = dequantized - source
     norm = float(source.norm())
-    audit = (_candidate_audit(source, indices, row_scales, block_scales, codebook,
-                              importance, config)
-             if config.assignment_mode == "shortlist" and not spec.affine else None)
+    audit = _candidate_audit(
+        source, indices, row_scales, block_scales, codebook, importance, config,
+        affine_nibbles=affine)
     decoded_codes = codebook.decode(indices).reshape_as(source)
     scalar = torch.empty_like(decoded_codes)
     if row_scales is not None:
@@ -509,12 +656,25 @@ def project_weight(weight: torch.Tensor, codebook: Codebook, importance: Importa
     changed = (decoded_codes != scalar).reshape(-1, 8).sum(1)
     weighted_error, weighted_source = _weighted_norms(source, delta, importance,
                                                        config.weight_metric)
+    usage = _codeword_usage(indices, codebook)
+    source_scale_range = _scale_range(source_scales)
+    rounded_scale_range = _scale_range(rounded_scales)
+    factorization_fallbacks = sum(
+        int(value["factorization_fallbacks"]) for value in gptq_reports)
+    fallback_scale_units = sum(
+        int(value["factorization_fallbacks"] > 0) for value in gptq_reports)
+    zero_scale_units = sum(int(value == 0) for value in rounded_scales)
+    elapsed_seconds = time.perf_counter() - started
+    peak_memory_bytes = max(peak_memory_baseline, _process_peak_rss_bytes())
     report = {
         "profile": config.profile,
         "shape": [rows, width],
+        "logical_shape": [rows, width],
         "codebook_id": codebook.id,
         "codebook_sha256": codebook.sha256(),
         "scale_dtype": str(config.scale_dtype).removeprefix("torch."),
+        "source_scale_range": source_scale_range,
+        "rounded_scale_range": rounded_scale_range,
         "raw_bpw": spec.index_bits / 8 + (0.125 if spec.affine else 0),
         "effective_bpw": payload.numel() * 8 / source.numel()
                          + (0 if row_scales is None else row_scales.numel() * 16 / source.numel()),
@@ -523,31 +683,77 @@ def project_weight(weight: torch.Tensor, codebook: Codebook, importance: Importa
         "max_abs_error": float(delta.abs().max()),
         "weighted_relative_error": math.sqrt(weighted_error / max(weighted_source, 1e-30)),
         "scalar_pattern_exact_hit_rate": float((changed == 0).float().mean()),
+        "mean_changed_trits_per_group": float(changed.float().mean()),
         "changed_trits_histogram": {
             str(value): int((changed == value).sum()) for value in range(9)
         },
+        "underflow_count": underflow_count,
+        "rounding_underflow_events": rounding_underflow_events,
         "zero_rows": zero_rows,
+        "zero_scale_units": zero_scale_units,
         "rejected_refits": rejected_refits,
+        "fallback_count": factorization_fallbacks,
+        "factorization_fallbacks": factorization_fallbacks,
+        "fallback_scale_units": fallback_scale_units,
         "iteration_objectives": traces,
-        "elapsed_seconds": time.perf_counter() - started,
-        "index_entropy": _index_entropy(indices),
-        "dead_codewords": int(codebook.legal_index_mask().sum()
-                              - torch.unique(indices).numel()),
+        "elapsed_seconds": elapsed_seconds,
+        "peak_memory_bytes": peak_memory_bytes,
+        "peak_memory_baseline_bytes": peak_memory_baseline,
+        "peak_memory_delta_bytes": max(0, peak_memory_bytes - peak_memory_baseline),
+        "peak_memory_scope": "process_high_water_rss",
+        "peak_memory_measurement": "resource.getrusage(RUSAGE_SELF).ru_maxrss",
+        "index_entropy": usage["entropy_bits"],
+        "codeword_entropy_bits": usage["entropy_bits"],
+        "dead_codewords": usage["dead_codewords"],
+        "top_codeword_usages": usage["top_usages"],
         "gptq_feedback": config.gptq_feedback,
         "gptq": gptq_reports,
         "candidate_oracle": audit,
-        "scale_min": (float(row_scales.float().min()) if row_scales is not None
-                      else float(block_scales.float().min())),
-        "scale_max": (float(row_scales.float().max()) if row_scales is not None
-                      else float(block_scales.float().max())),
+        "scale_min": rounded_scale_range["min"],
+        "scale_median": rounded_scale_range["median"],
+        "scale_max": rounded_scale_range["max"],
     }
     return PTQResult(payload, row_scales, indices, affine_blocks, dequantized, report)
 
 
-def _index_entropy(indices: torch.Tensor) -> float:
-    counts = torch.bincount(indices.reshape(-1), minlength=int(indices.max()) + 1).double()
-    probabilities = counts[counts > 0] / counts.sum()
-    return float(-(probabilities * probabilities.log2()).sum())
+def _scale_range(values: list[float]) -> dict[str, float]:
+    if not values:
+        raise ValueError("PTQ scale inventory is empty")
+    tensor = torch.tensor(values, dtype=torch.float64)
+    if not torch.isfinite(tensor).all() or torch.any(tensor < 0):
+        raise ValueError("PTQ scale inventory is invalid")
+    return {
+        "min": float(tensor.min()),
+        "median": float(tensor.median()),
+        "max": float(tensor.max()),
+    }
+
+
+def _codeword_usage(indices: torch.Tensor, codebook: Codebook, *, top_k: int = 10) \
+        -> dict[str, Any]:
+    counts = torch.bincount(indices.reshape(-1), minlength=codebook.index_count).double()
+    legal = codebook.legal_index_mask()
+    if counts.numel() != legal.numel() or torch.any(counts[~legal] != 0):
+        raise ValueError("PTQ result contains an illegal codebook index")
+    legal_counts = counts[legal]
+    probabilities = legal_counts[legal_counts > 0] / counts.sum()
+    entropy = float(-(probabilities * probabilities.log2()).sum())
+    ordered = sorted(
+        (int(index) for index in torch.nonzero(legal).flatten()),
+        key=lambda index: (-float(counts[index]), index))
+    top = [
+        {
+            "index": index,
+            "count": int(counts[index]),
+            "fraction": float(counts[index] / counts.sum()),
+        }
+        for index in ordered[:top_k] if counts[index] > 0
+    ]
+    return {
+        "entropy_bits": entropy,
+        "dead_codewords": int((legal_counts == 0).sum()),
+        "top_usages": top,
+    }
 
 
 def _weighted_norms(source: torch.Tensor, delta: torch.Tensor, importance: Importance,
@@ -572,34 +778,78 @@ def _weighted_norms(source: torch.Tensor, delta: torch.Tensor, importance: Impor
 def _candidate_audit(source: torch.Tensor, selected_indices: torch.Tensor,
                      row_scales: torch.Tensor | None, block_scales: torch.Tensor | None,
                      codebook: Codebook, importance: Importance, config: PTQConfig,
-                     sample_count: int = 256) -> dict[str, Any]:
-    total = selected_indices.numel()
+                     sample_count: int = 256,
+                     affine_nibbles: torch.Tensor | None = None) -> dict[str, Any]:
+    affine = "-a4-" in config.profile
+    if affine:
+        expected = (selected_indices.shape[0], selected_indices.shape[1] // 4)
+        if affine_nibbles is None or tuple(affine_nibbles.shape) != expected:
+            raise ValueError("A4 candidate audit requires the complete affine inventory")
+        total = affine_nibbles.numel()
+        sample_count = min(sample_count, 32)
+        sample_unit = "affine_subblock32"
+    else:
+        if affine_nibbles is not None:
+            raise ValueError("strict candidate audit received unexpected affine nibbles")
+        total = selected_indices.numel()
+        sample_unit = "codeword_group8"
+    if config.assignment_mode == "exhaustive":
+        return {
+            "comparison_performed": False,
+            "reason": "assignment path is already the exhaustive oracle",
+            "sample_unit": sample_unit,
+            "population_count": total,
+            "sample_count": 0,
+            "mismatch_count": 0,
+            "mismatch_rate": 0.0,
+            "mean_excess_objective": 0.0,
+            "max_excess_objective": 0.0,
+        }
     count = min(sample_count, total)
     positions = torch.linspace(0, total - 1, count, dtype=torch.float64).round().long().unique()
+    shortlist = replace(config, assignment_mode="shortlist", gptq_feedback=False)
     exhaustive = replace(config, assignment_mode="exhaustive", gptq_feedback=False)
     mismatches = 0
     excess = []
     groups_per_row = selected_indices.shape[1]
     metric_cache: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
     for position in positions.tolist():
-        row, group = divmod(position, groups_per_row)
+        if affine:
+            row, subblock = divmod(position, groups_per_row // 4)
+            group = subblock * 4
+            group_slice = slice(group, group + 4)
+        else:
+            row, group = divmod(position, groups_per_row)
+            group_slice = slice(group, group + 1)
         if row not in metric_cache:
             metric_cache[row] = _metric_for_row(source[row], importance, config.weight_metric)
         diag, cov = metric_cache[row]
         scale = (float(row_scales[row]) if row_scales is not None
                  else float(block_scales[row, group // 32]))
-        target = source[row, group * 8:group * 8 + 8][None]
-        diag_group = diag[group:group + 1]
-        cov_group = None if cov is None else cov[group:group + 1]
-        oracle_idx, _, oracle_error = _assign_groups(
-            target, scale, codebook, diag_group, cov_group, exhaustive)
-        selected = selected_indices[row, group:group + 1]
-        selected_word = codebook.decode(selected).float()
-        selected_error = _errors(target, selected_word[:, None] * scale,
-                                 diag_group, cov_group)[0, 0]
-        mismatches += int(selected.item() != oracle_idx.item())
-        excess.append(max(0.0, float(selected_error - oracle_error[0])))
+        target = source[row].reshape(-1, 8)[group_slice]
+        diag_group = diag[group_slice]
+        cov_group = None if cov is None else cov[group_slice]
+        if affine:
+            short_idx, _, short_error, short_nibble = _assign_a4(
+                target, scale, codebook, diag_group, cov_group, shortlist)
+            oracle_idx, _, oracle_error, oracle_nibble = _assign_a4(
+                target, scale, codebook, diag_group, cov_group, exhaustive)
+            mismatches += int(
+                int(short_nibble[0]) != int(oracle_nibble[0])
+                or not torch.equal(short_idx, oracle_idx))
+            objective_excess = float(short_error.sum() - oracle_error.sum())
+        else:
+            short_idx, _, short_error = _assign_groups(
+                target, scale, codebook, diag_group, cov_group, shortlist)
+            oracle_idx, _, oracle_error = _assign_groups(
+                target, scale, codebook, diag_group, cov_group, exhaustive)
+            mismatches += int(short_idx.item() != oracle_idx.item())
+            objective_excess = float(short_error[0] - oracle_error[0])
+        excess.append(max(0.0, objective_excess))
     return {
+        "comparison_performed": True,
+        "sample_unit": sample_unit,
+        "population_count": total,
         "sample_count": len(positions),
         "mismatch_count": mismatches,
         "mismatch_rate": mismatches / max(len(positions), 1),

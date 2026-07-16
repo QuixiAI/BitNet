@@ -99,7 +99,8 @@ def load_profile(path: str | Path) -> ArchProfile:
             "margin", "lambda_margin", "tensor_overrides",
             "assignment_chunk", "lambda_hidden", "hidden_layers",
             "freeze_flip_threshold", "freeze_margin_threshold", "freeze_sustain_evals",
-            "freeze_trend_tolerance",
+            "freeze_trend_tolerance", "freeze_max_zero_fraction",
+            "freeze_max_scale_underflows",
             "shared_embedding_head", "shared_head_importance",
             "shared_embedding_importance",
         }
@@ -260,7 +261,7 @@ def load_converted(ckpt_dir: str | Path, profile: ArchProfile,
 def _convert_tq1(model: nn.Module, profile: ArchProfile,
                   artifact_path: str | Path | None) -> ConversionReport:
     from bitnet_train.tq1.artifact import ArtifactReader
-    from bitnet_train.tq1.calibration import load_calibration_artifact
+    from bitnet_train.tq1.calibration import file_sha256, load_calibration_artifact
     from bitnet_train.tq1.packing import unpack_payload
     from bitnet_train.tq1.qat import TQ1Embedding, TQ1Linear, TQ1OutputHead
     from bitnet_train.tq1.spec import FLOAT_PROFILES
@@ -275,6 +276,14 @@ def _convert_tq1(model: nn.Module, profile: ArchProfile,
         raise ValueError("profile default TQ1 format differs from canonical artifact")
     if profile.quant.get("default_codebook_id") != quant_spec.default_codebook_id:
         raise ValueError("profile default codebook differs from canonical artifact")
+    for name in ("activation_mode", "candidate_count"):
+        if name in profile.quant and profile.quant[name] != getattr(quant_spec, name):
+            raise ValueError(f"profile {name} differs from canonical artifact")
+    if "tensor_overrides" in profile.quant:
+        configured_overrides = profile.quant["tensor_overrides"]
+        expected_overrides = [rule.to_dict() for rule in quant_spec.tensor_overrides]
+        if configured_overrides != expected_overrides:
+            raise ValueError("profile tensor_overrides differ from canonical artifact")
     if "shared_embedding_head" in profile.quant \
             and bool(profile.quant["shared_embedding_head"]) \
             != quant_spec.shared_embedding_head:
@@ -291,8 +300,20 @@ def _convert_tq1(model: nn.Module, profile: ArchProfile,
             raise ValueError("profile QuantSpec differs from canonical artifact")
     registry = reader.registry()
     statistics = {}
-    if profile.quant.get("importance_stats"):
-        statistics, _ = load_calibration_artifact(profile.quant["importance_stats"])
+    importance_path = profile.quant.get("importance_stats")
+    if quant_spec.importance_mode != "uniform" and not importance_path:
+        raise ValueError(
+            f"{quant_spec.importance_mode} QAT requires quant.importance_stats")
+    if importance_path:
+        statistics, _ = load_calibration_artifact(importance_path)
+        expected_statistics_hash = reader.manifest["provenance"].get(
+            "calibration_statistics_sha256")
+        observed_statistics_hash = file_sha256(importance_path)
+        if quant_spec.importance_mode != "uniform" and not expected_statistics_hash:
+            raise ValueError("canonical artifact does not bind its calibration statistics")
+        if expected_statistics_hash is not None \
+                and observed_statistics_hash != expected_statistics_hash:
+            raise ValueError("QAT importance statistics differ from the PTQ artifact")
 
     classes = classify_linears(model, profile)
     configured_targets = sorted(name for name, kind in classes.items() if kind == TERNARIZE)

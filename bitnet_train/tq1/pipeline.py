@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -27,7 +28,8 @@ from .packing import layout
 from .oracle import dequantize_weight
 from .ptq import Importance, PTQConfig, PTQResult, project_weight
 from .solver import (
-    build_product_codebook, corpus_from_tensors, facility_location_select)
+    PatternCorpus, build_product_codebook, corpus_from_tensors, facility_location_select,
+    sensitivity_corpus_from_tensors)
 from .spec import FLOAT_PROFILES, QuantSpec
 
 
@@ -37,6 +39,19 @@ LLAMA_TARGET_REGEXES = (
 )
 LLAMA_KEEP_FP_REGEXES = (r"lm_head",)
 LLAMA_SHARED_EMBEDDING_REGEX = r"model\.embed_tokens"
+LLAMA_PROJECTION_FAMILIES = (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+)
+
+
+def _projection_family(module_name: str) -> str:
+    for family in LLAMA_PROJECTION_FAMILIES:
+        if module_name == family or module_name.endswith("." + family):
+            return family
+    if module_name == "embed_tokens" or module_name.endswith(".embed_tokens"):
+        return "shared_embedding_head"
+    return module_name.rsplit(".", 1)[-1]
 
 
 @dataclass(frozen=True)
@@ -141,26 +156,135 @@ def classify_model_linears(model: nn.Module, quant_spec: QuantSpec, *,
     return LinearInventory(tuple(sorted(target)), tuple(sorted(keep)), tuple(sorted(shared)))
 
 
+def _scalar_pattern(weight: torch.Tensor,
+                    diagonal: torch.Tensor | None = None) -> torch.Tensor:
+    value = weight.detach().float().cpu()
+    if value.ndim != 2:
+        raise ValueError("scalar-pattern source weight must be a matrix")
+    if diagonal is None:
+        scale = value.abs().mean(dim=1, keepdim=True)
+    else:
+        metric = diagonal.detach().float().cpu().reshape(-1)
+        if tuple(metric.shape) != (value.shape[1],) \
+                or not torch.isfinite(metric).all() or torch.any(metric < 0) \
+                or float(metric.sum()) <= 0:
+            raise ValueError("scalar-pattern diagonal importance is invalid")
+        scale = (value.abs() * metric).sum(1, keepdim=True) / metric.sum()
+    denominator = torch.where(scale > 0, scale, torch.ones_like(scale))
+    return torch.round(value / denominator).clamp(-1, 1).to(torch.int8)
+
+
+def scalar_pattern_tensors(
+        model: nn.Module, inventory: LinearInventory, *,
+        statistics: Mapping[str, torch.Tensor] | None = None,
+        importance_mode: str = "uniform") \
+        -> dict[str, torch.Tensor]:
+    """Return ordinary row-scale ternary initialization for every target."""
+    if importance_mode not in {"uniform", "diagonal", "covariance8", "block256"}:
+        raise ValueError("unsupported scalar-pattern importance mode")
+    source = statistics or {}
+    with torch.no_grad():
+        result = {}
+        for name in inventory.quantized_modules():
+            diagonal = None
+            if importance_mode != "uniform":
+                suffix = "cov8" if importance_mode == "covariance8" else "diag"
+                key = f"{name}.{suffix}"
+                if key not in source:
+                    raise ValueError(
+                        f"{name}: scalar-pattern construction is missing {suffix}")
+                statistic = source[key]
+                diagonal = (statistic.diagonal(dim1=-2, dim2=-1).reshape(-1)
+                            if suffix == "cov8" else statistic)
+            result[name] = _scalar_pattern(
+                model.get_submodule(name).weight, diagonal)
+        return result
+
+
 def scalar_pattern_corpus(model: nn.Module, inventory: LinearInventory, *,
                           weighting: str = "family_equal"):
     """Build the Section 9 corpus using one ordinary initializer scale per row."""
-    patterns: dict[str, torch.Tensor] = {}
-    with torch.no_grad():
-        for name in inventory.quantized_modules():
-            weight = model.get_submodule(name).weight.detach().float().cpu()
-            scale = weight.abs().mean(dim=1, keepdim=True)
-            denominator = torch.where(scale > 0, scale, torch.ones_like(scale))
-            trits = torch.round(weight / denominator).clamp(-1, 1).to(torch.int8)
-            patterns[name] = trits.reshape(-1, 8)
-    return corpus_from_tensors(patterns, weighting=weighting)
+    return corpus_from_tensors(
+        scalar_pattern_tensors(model, inventory), weighting=weighting)
+
+
+def scalar_pattern_family_corpora(
+        model: nn.Module, inventory: LinearInventory,
+        statistics: Mapping[str, torch.Tensor], *, importance_mode: str,
+        weighting: str = "parameter") -> dict[str, PatternCorpus]:
+    """Build held-out Section 9.6 sensitivity corpora by projection family."""
+    if importance_mode not in {"diagonal", "covariance8"}:
+        raise ValueError("codebook study sensitivity must be diagonal or covariance8")
+    by_family: dict[str, list[str]] = {}
+    metrics: dict[str, torch.Tensor] = {}
+    suffix = "diag" if importance_mode == "diagonal" else "cov8"
+    for name in inventory.target:
+        family = _projection_family(name)
+        if family not in LLAMA_PROJECTION_FAMILIES:
+            raise ValueError(f"{name}: target has no primary Llama projection family")
+        key = f"{name}.{suffix}"
+        if key not in statistics:
+            raise ValueError(f"{name}: held-out statistics are missing {suffix}")
+        by_family.setdefault(family, []).append(name)
+        metrics[name] = statistics[key]
+    expected = set(LLAMA_PROJECTION_FAMILIES)
+    if set(by_family) != expected:
+        raise ValueError("held-out corpus does not cover all primary Llama families")
+    result = {}
+    for family, names in sorted(by_family.items()):
+        family_metrics = {name: metrics[name] for name in names}
+        with torch.no_grad():
+            family_patterns = {
+                name: _scalar_pattern(
+                    model.get_submodule(name).weight,
+                    (family_metrics[name].reshape(-1)
+                     if importance_mode == "diagonal" else
+                     family_metrics[name].diagonal(
+                         dim1=-2, dim2=-1).reshape(-1)))
+                for name in names
+            }
+        result[family] = sensitivity_corpus_from_tensors(
+            family_patterns,
+            diagonal=family_metrics if importance_mode == "diagonal" else None,
+            covariance=family_metrics if importance_mode == "covariance8" else None,
+            weighting=weighting)
+    return result
 
 
 def learn_model_codebook(model: nn.Module, inventory: LinearInventory, *,
                          codebook_id: str, index_format: str,
                          encoding: str = "sign_canonical",
                          weighting: str = "family_equal", lambda_nz: float = 0.0,
-                         swap_limit: int = 1, scope: str = "model") -> Codebook:
-    corpus = scalar_pattern_corpus(model, inventory, weighting=weighting)
+                         swap_limit: int = 1, scope: str = "model",
+                         statistics: Mapping[str, torch.Tensor] | None = None,
+                         importance_mode: str = "uniform") -> Codebook:
+    if importance_mode not in {"uniform", "diagonal", "covariance8", "block256"}:
+        raise ValueError("unsupported codebook importance mode")
+    patterns = scalar_pattern_tensors(
+        model, inventory, statistics=statistics,
+        importance_mode=importance_mode)
+    if importance_mode == "uniform":
+        corpus = corpus_from_tensors(patterns, weighting=weighting)
+        effective_importance = "uniform"
+    else:
+        source = statistics or {}
+        # Block256 calibration always carries its diagonal companion.  The
+        # eight-trit codebook objective uses that diagonal rather than claiming
+        # that cross-group covariance is representable by PatternCorpus.
+        suffix = "cov8" if importance_mode == "covariance8" else "diag"
+        metrics = {}
+        for name in patterns:
+            key = f"{name}.{suffix}"
+            if key not in source:
+                raise ValueError(f"{name}: codebook construction is missing {suffix}")
+            metrics[name] = source[key]
+        corpus = sensitivity_corpus_from_tensors(
+            patterns,
+            diagonal=metrics if suffix == "diag" else None,
+            covariance=metrics if suffix == "cov8" else None,
+            weighting=weighting)
+        effective_importance = (
+            "diagonal" if importance_mode == "block256" else importance_mode)
     if encoding == "sign_canonical":
         count = 1024 if index_format == "v11" else 2048
         shapes, report = facility_location_select(
@@ -172,12 +296,17 @@ def learn_model_codebook(model: nn.Module, inventory: LinearInventory, *,
             provenance={
                 "source": "model", "algorithm": "facility_location",
                 "weighting": weighting, "lambda_nz": lambda_nz,
+                "importance_mode": effective_importance,
                 **report,
             })
     if encoding == "product":
-        return build_product_codebook(
+        book = build_product_codebook(
             codebook_id=codebook_id, index_format=index_format, corpus=corpus,
             swap_limit=swap_limit, scope=scope)
+        return Codebook(
+            book.id, book.index_format, book.encoding, book.scope, book.tables,
+            {**book.provenance, "source": "model", "weighting": weighting,
+             "importance_mode": effective_importance})
     raise ValueError("direct IQ1 codebooks must be loaded from the pinned repository asset")
 
 
@@ -283,9 +412,14 @@ def collect_statistics(model: nn.Module, tokenizer, inventory: LinearInventory, 
         extras[f"{embedding_name}.token_frequency"] = frequency
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    tokenizer_hash, template_hash = tokenizer_identity(tokenizer)
     save_calibration_artifact(output, sums, metadata={
         **metadata,
+        "tokenizer_sha256": tokenizer_hash,
+        "chat_template_sha256": template_hash,
         "calibration_file_sha256": file_sha256(calibration_file),
+        "parsing_mode": "jsonl_messages_text_prompt_content_or_plaintext",
+        "chat_template_mode": "tokenizer_apply_chat_template_no_generation_prompt",
         "sample_limit": sample_count,
         "sequence_cap": sequence_cap,
         "modes": list(modes),
@@ -322,13 +456,28 @@ def _source_digest(path: Path) -> str:
 def executable_source_hashes() -> dict[str, str]:
     directory = Path(__file__).resolve().parent
     repository = directory.parents[1]
-    paths = list(sorted(directory.glob("*.py"))) + [
-        repository / "bitnet_train" / "cpu" / "src" / "bitnet_cpu.c",
-        repository / "bitnet_train" / "cpu" / "bitnet_cpu.py",
-        repository / "bitnet_train" / "export" / "compare_gguf.py",
-        repository / "bitnet_train" / "export" / "export_gguf.py",
+    paths = set(directory.rglob("*.py"))
+    source_trees = {
+        repository / "quant": {".py", ".sh", ".patch", ".c", ".cc", ".cpp", ".h",
+                                ".hpp"},
+        repository / "bitnet_train" / "cpu": {
+            ".py", ".sh", ".c", ".cc", ".cpp", ".h", ".hpp"},
+        repository / "bitnet_train" / "metal": {
+            ".py", ".sh", ".metal", ".c", ".cc", ".cpp", ".h", ".hpp", ".m",
+            ".mm"},
+        repository / "bitnet_train" / "export": {
+            ".py", ".sh", ".c", ".cc", ".cpp", ".h", ".hpp"},
+    }
+    for root, suffixes in source_trees.items():
+        paths.update(path for path in root.rglob("*")
+                     if path.is_file() and path.suffix in suffixes)
+    paths.update({
+        repository / "bitnet_train" / "bitlinear.py",
+        repository / "bitnet_train" / "conversion.py",
+        repository / "bitnet_train" / "distill.py",
         repository / "train" / "train.py",
-    ]
+    })
+    paths = sorted(path for path in paths if path.is_file())
     return {
         str(path.relative_to(repository)): _source_digest(path)
         for path in paths
@@ -338,13 +487,44 @@ def executable_source_hashes() -> dict[str, str]:
 def repository_provenance() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
     def run(*args: str) -> str:
-        result = subprocess.run(args, cwd=root, check=False, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            result = subprocess.run(args, cwd=root, check=False, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return ""
         return result.stdout.strip()
+    def package_version(name: str) -> str:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return "not-installed"
+
+    cpu_name = platform.processor() or run("sysctl", "-n", "machdep.cpu.brand_string") \
+        or platform.machine()
+    cuda_devices = []
+    if torch.cuda.is_available():
+        cuda_devices = [torch.cuda.get_device_name(index)
+                        for index in range(torch.cuda.device_count())]
+
     return {
         "repository_commit": run("git", "rev-parse", "HEAD") or "unknown",
         "dirty_worktree": bool(run("git", "status", "--porcelain")),
         "os": platform.platform(),
+        "machine": platform.machine(),
+        "python_compiler": platform.python_compiler(),
+        "c_compiler": (run(os.environ.get("CC", "cc"), "--version").splitlines()
+                       or ["unavailable"])[0],
+        "transformers": package_version("transformers"),
+        "safetensors": package_version("safetensors"),
+        "torch_initial_seed": torch.initial_seed(),
+        "ptq_assignment_device": "cpu",
+        "device_inventory": {
+            "cpu": cpu_name,
+            "mps_available": bool(torch.backends.mps.is_available()),
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_runtime": torch.version.cuda,
+            "cuda_devices": cuda_devices,
+        },
         "source_hashes": executable_source_hashes(),
     }
 
@@ -358,23 +538,67 @@ def tokenizer_identity(tokenizer) -> tuple[str, str]:
     return tokenizer_hash, template_hash
 
 
-def _aggregate_reports(reports: Mapping[str, Mapping[str, Any]],
-                       tensor_sizes: Mapping[str, int]) -> dict[str, Any]:
+def _report_summary(reports: Mapping[str, Mapping[str, Any]],
+                    tensor_sizes: Mapping[str, int]) -> dict[str, Any]:
+    if not reports or set(reports) != set(tensor_sizes):
+        raise ValueError("PTQ report and tensor-size inventories must be equal and nonempty")
     total = sum(tensor_sizes.values())
     weighted_keys = ("rmse", "relative_l2", "weighted_relative_error",
-                     "scalar_pattern_exact_hit_rate", "effective_bpw")
-    aggregate = {
+                     "scalar_pattern_exact_hit_rate", "mean_changed_trits_per_group",
+                     "codeword_entropy_bits", "effective_bpw")
+    summary = {
         key: sum(float(reports[name][key]) * tensor_sizes[name]
                  for name in reports) / max(total, 1)
         for key in weighted_keys
     }
-    aggregate.update({
+    candidate_samples = sum(
+        int(reports[name]["candidate_oracle"]["sample_count"]) for name in reports)
+    candidate_mismatches = sum(
+        int(reports[name]["candidate_oracle"]["mismatch_count"]) for name in reports)
+    summary.update({
         "target_tensors": len(reports),
         "target_parameters": total,
+        "maximum_absolute_error": max(float(report["max_abs_error"])
+                                      for report in reports.values()),
         "packed_payload_bytes": sum(
             int(reports[name]["physical_payload_bytes"]) for name in reports),
         "row_scale_bytes": sum(int(reports[name]["row_scale_bytes"]) for name in reports),
+        "underflow_count": sum(int(report["underflow_count"])
+                               for report in reports.values()),
+        "zero_rows": sum(int(report["zero_rows"]) for report in reports.values()),
+        "fallback_count": sum(int(report["fallback_count"])
+                              for report in reports.values()),
+        "rejected_refits": sum(int(report["rejected_refits"])
+                               for report in reports.values()),
+        "elapsed_seconds": sum(float(report["elapsed_seconds"])
+                               for report in reports.values()),
+        "candidate_oracle": {
+            "sample_count": candidate_samples,
+            "mismatch_count": candidate_mismatches,
+            "mismatch_rate": candidate_mismatches / max(candidate_samples, 1),
+            "max_excess_objective": max(
+                float(report["candidate_oracle"]["max_excess_objective"])
+                for report in reports.values()),
+        },
     })
+    return summary
+
+
+def _aggregate_reports(reports: Mapping[str, Mapping[str, Any]],
+                       tensor_sizes: Mapping[str, int]) -> dict[str, Any]:
+    aggregate = _report_summary(reports, tensor_sizes)
+    families: dict[str, list[str]] = {}
+    for name, report in reports.items():
+        family = report.get("projection_family")
+        if not isinstance(family, str) or not family:
+            raise ValueError(f"{name}: PTQ report has no projection family")
+        families.setdefault(family, []).append(name)
+    aggregate["projection_families"] = {
+        family: _report_summary(
+            {name: reports[name] for name in names},
+            {name: tensor_sizes[name] for name in names})
+        for family, names in sorted(families.items())
+    }
     return aggregate
 
 
@@ -417,6 +641,7 @@ def run_full_model_ptq(model: nn.Module, quant_spec: QuantSpec,
         result.report.update({
             "module_path": module_name,
             "state_dict_name": state_name,
+            "projection_family": _projection_family(module_name),
             "physical_payload_bytes": result.payload.numel(),
             "row_scale_bytes": 0 if result.row_scales is None
             else result.row_scales.numel() * result.row_scales.element_size(),
@@ -440,6 +665,7 @@ def run_full_model_ptq(model: nn.Module, quant_spec: QuantSpec,
         result.report.update({
             "module_path": module_name,
             "state_dict_name": state_name,
+            "projection_family": "shared_embedding_head",
             "physical_payload_bytes": result.payload.numel(),
             "row_scale_bytes": 0 if result.row_scales is None
             else result.row_scales.numel() * result.row_scales.element_size(),

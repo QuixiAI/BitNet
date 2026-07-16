@@ -61,17 +61,23 @@ def _case(profile: str, activation_mode: str, *, bf16_scale: bool = False):
     N, K = 7, 512
     legal = torch.nonzero(book.legal_index_mask()).flatten()
     indices = legal[torch.randint(0, legal.numel(), (N, K // 8))]
+    zero_index = torch.nonzero(
+        (book.decode(torch.arange(book.index_count)) == 0).all(1)
+        & book.legal_index_mask()).item()
     kwargs = {}
     if layout(profile).scale_mode == "block256":
         kwargs["block_scales"] = torch.rand(N, K // 256, dtype=torch.float16)
         kwargs["block_scales"][0, 0] = 0
+        indices[0, :32] = zero_index
         row_scales = None
     else:
         row_scales = torch.rand(N).to(torch.bfloat16 if bf16_scale else torch.float16)
         row_scales[0] = 0
+        indices[0] = zero_index
     if layout(profile).affine:
         kwargs["affine_nibbles"] = torch.randint(
             0, 12, (N, K // 256, 8), dtype=torch.uint8)
+        kwargs["affine_nibbles"][0] = 0
     payload = pack_payload(indices, profile, **kwargs)
     x = torch.randn(1, K)
     expected = linear_w2a8(
@@ -242,6 +248,10 @@ def test_pinned_iq1_direct_joint_runs_end_to_end():
     torch.manual_seed(191)
     N, K = 3, 256
     indices = torch.randint(0, book.index_count, (N, K // 8))
+    zero_index = torch.nonzero(
+        (book.decode(torch.arange(book.index_count)) == 0).all(1)
+        & book.legal_index_mask()).item()
+    indices[0] = zero_index
     payload = pack_payload(indices, "tq1_v11-i-r")
     scales = torch.tensor([0.0, 0.125, 0.25], dtype=torch.float16)
     x = torch.randn(1, K)

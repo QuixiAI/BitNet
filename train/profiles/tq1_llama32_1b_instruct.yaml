@@ -40,6 +40,8 @@ quant:
   freeze_margin_threshold: 0.0
   freeze_sustain_evals: 3
   freeze_trend_tolerance: 0.01
+  freeze_max_zero_fraction: 0.95
+  freeze_max_scale_underflows: 0
   margin: 0.1
   lambda_margin: 0.01
   hidden_layers: [4, 8, 12, 16]

@@ -40,6 +40,9 @@ def layout(profile: str | ProfileLayout) -> ProfileLayout:
 
 def pack_indices(indices: torch.Tensor, profile: str | ProfileLayout) -> torch.Tensor:
     spec = layout(profile)
+    if indices.dtype == torch.bool or indices.is_floating_point() \
+            or indices.is_complex() or indices.is_quantized:
+        raise ValueError("index payload requires an integer tensor dtype")
     values = indices.detach().to(torch.int64).cpu()
     if values.ndim < 1 or values.shape[-1] % 32:
         raise ValueError("index rows must contain a multiple of 32 groups")
@@ -64,7 +67,9 @@ def pack_indices(indices: torch.Tensor, profile: str | ProfileLayout) -> torch.T
 
 def unpack_indices(payload: torch.Tensor, profile: str | ProfileLayout) -> torch.Tensor:
     spec = layout(profile)
-    data = payload.detach().to(torch.uint8).cpu()
+    if payload.dtype != torch.uint8:
+        raise ValueError("packed index payload must use uint8 storage")
+    data = payload.detach().cpu()
     if data.ndim < 2 or data.shape[-1] != spec.raw_index_bytes:
         raise ValueError(f"index payload must end in {spec.raw_index_bytes} bytes")
     leading = data.shape[:-2]
@@ -85,12 +90,17 @@ def unpack_indices(payload: torch.Tensor, profile: str | ProfileLayout) -> torch
 
 
 def _fp16_bytes(values: torch.Tensor) -> torch.Tensor:
-    fp16 = values.detach().to(device="cpu", dtype=torch.float16).contiguous()
+    if values.dtype != torch.float16 or not torch.isfinite(values).all() \
+            or torch.any(values < 0):
+        raise ValueError("embedded block scales must be finite nonnegative float16")
+    fp16 = values.detach().to(device="cpu").contiguous()
     return fp16.view(torch.uint8).reshape(*fp16.shape, 2)
 
 
 def _fp16_from_bytes(values: torch.Tensor) -> torch.Tensor:
-    raw = values.detach().to(torch.uint8).cpu().contiguous()
+    if values.dtype != torch.uint8:
+        raise ValueError("FP16 byte payload must use uint8 storage")
+    raw = values.detach().cpu().contiguous()
     if raw.shape[-1] != 2:
         raise ValueError("FP16 byte payload must end in two bytes")
     return raw.reshape(*raw.shape[:-1], 2).view(torch.float16).squeeze(-1)
@@ -115,6 +125,9 @@ def pack_payload(indices: torch.Tensor, profile: str | ProfileLayout, *,
         return packed
     if affine_nibbles is None or tuple(affine_nibbles.shape) != (*packed.shape[:-1], 8):
         raise ValueError("A4 requires eight affine nibbles per payload block")
+    if affine_nibbles.dtype == torch.bool or affine_nibbles.is_floating_point() \
+            or affine_nibbles.is_complex() or affine_nibbles.is_quantized:
+        raise ValueError("A4 affine nibbles require an integer tensor dtype")
     nibble = affine_nibbles.detach().to(torch.int64).cpu()
     if nibble.numel() and (int(nibble.min()) < 0 or int(nibble.max()) > 11):
         raise ValueError("A4 nibble uses a reserved value outside the 12 legal rho/mu pairs")
@@ -127,7 +140,9 @@ def pack_payload(indices: torch.Tensor, profile: str | ProfileLayout, *,
 def unpack_payload(payload: torch.Tensor, profile: str | ProfileLayout) \
         -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     spec = layout(profile)
-    data = payload.detach().to(torch.uint8).cpu()
+    if payload.dtype != torch.uint8:
+        raise ValueError("TQ1 payload must use uint8 storage")
+    data = payload.detach().cpu()
     if data.ndim < 2 or data.shape[-1] != spec.block_bytes:
         raise ValueError(f"{spec.name} payload must end in {spec.block_bytes} bytes")
     if spec.scale_mode == "block256":

@@ -138,6 +138,7 @@ def main(argv=None) -> int:
         "final_policy": dict(result.policy),
         "final_objective": result.objective,
         "final_total_bytes": result.total_bytes,
+        "termination_reason": result.termination_reason,
         "trials": list(result.trials),
         "evaluator_results": evaluations,
         "quant_spec": final_spec.to_dict(),

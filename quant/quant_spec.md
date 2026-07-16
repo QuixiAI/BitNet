@@ -234,7 +234,7 @@ class CodebookRef:
     id: str                              # [a-z0-9][a-z0-9_-]{0,62}
     format: str                          # v11 | v12
     encoding: str                        # sign_canonical | direct_joint | product
-    scope: str                           # universal | model
+    scope: str                           # universal | model | iq1
     sha256: str                          # full 64 hex characters
 
 @dataclass(frozen=True)
@@ -337,6 +337,10 @@ The numerical contract is round-to-nearest, ties-to-even for:
 Candidate-error ties MUST choose the lowest legal numerical index. Codebook
 construction ties MUST choose the lowest base-3 pattern ID. Kernel results may
 not depend on thread scheduling, unordered reductions, or hash-map iteration.
+Logical trits are validated as exact `-1`, `0`, or `+1` values before any dtype
+conversion. Packed indices and affine fields require integer tensors, and
+physical payloads require canonical `uint8` storage; casting a floating value
+and then validating the truncated result is nonconformant.
 
 ### 6.3 Activation quantization
 
@@ -547,7 +551,9 @@ and runtime implementations while preventing encoding or dimension aliasing.
 
 V11-I uses exactly the 2,048 `iq1s_grid` rows from the recorded read-only
 llama.cpp reference revision. The index is a direct table row; it has no
-shape/sign interpretation. All indices 0..2047 are legal, and the unique
+shape/sign interpretation. Its `CodebookRef.scope` is `iq1`; a model/universal
+direct-joint table or any other table hash is invalid for a V11-I QuantSpec.
+All indices 0..2047 are legal, and the unique
 all-zero row is index 1,029.
 
 Specification revision 1.0.0 pins the reference to:
@@ -760,7 +766,9 @@ A codebook may be:
 - `universal`: frozen across models and eligible for compile-time embedding;
 - `model`: constructed for one artifact and carried by that artifact;
 - `iq1`: the exact V11-I baseline;
-- `loaded`: reused bit-for-bit from a prior canonical artifact.
+- `loaded`: an operational source that reuses a prior canonical artifact
+  bit-for-bit while preserving its original `universal`, `model`, or `iq1`
+  scope and identity.
 
 The source, source hashes, solver configuration, input model revisions, and
 training/held-out split MUST be recorded.
@@ -769,7 +777,9 @@ training/held-out split MUST be recorded.
 
 For each source matrix:
 
-1. fit its ordinary BitNet initializer scale at the declared granularity;
+1. fit its ordinary BitNet initializer scale at the declared granularity using
+   Section 6.5's declared diagonal importance (the covariance diagonal for a
+   covariance8 corpus);
 2. form scalar ternary codes with the common rounding contract;
 3. split rows into aligned groups of eight;
 4. encode groups as base-3 IDs;
@@ -873,7 +883,41 @@ named baseline and cannot be labeled the production product solver.
 ### 9.6 Universal codebook acceptance
 
 A universal codebook is accepted only after evaluation on held-out model
-checkpoints not used to construct it. Report:
+checkpoints not used to construct it. Construction and held-out model identities
+are the pair `(model_id, immutable_revision)`; the two sets MUST be disjoint and
+duplicate-free. The primary Llama study uses at least two held-out checkpoints
+and reports all seven q/k/v/o/gate/up/down projection families for each one.
+
+Complete-universe coverage uses squared Euclidean distance in trit units. For
+each of the 6,561 source patterns `u`:
+
+~~~text
+coverage_distance(u) = min over legal codewords c of sum_i (u_i - c_i)^2
+~~~
+
+The histogram keys are the exact integer squared distances, its counts sum to
+6,561, and its maximum equals the greatest key. Reserved physical indices and
+duplicate product representatives are excluded; only canonical legal indices
+participate.
+
+For each held-out family corpus with demand `p(u)`, report:
+
+~~~text
+frequency_sum = sum_u p(u) * min_c ||u-c||^2
+sensitivity_sum = sum_u p(u) * min_c (u-c).T H_u (u-c)
+exact_hit_rate = sum_{u exactly represented} p(u) / sum_u p(u)
+mean = sum / sum_u p(u)
+~~~
+
+The frequency and sensitivity minimizers are independent. `H_u` MUST be a real
+diagonal or covariance8 statistic from the held-out checkpoint; substituting a
+uniform identity and labeling it sensitivity evidence is forbidden. Per-model
+metrics are demand-mass aggregates of their family rows, and the study aggregate
+is the corresponding aggregate over models. All sums, masses, rates, and means
+must reconcile mechanically. The per-family corpus hash is the safetensors file
+SHA-256; the per-model corpus hash is its extraction `manifest.json` SHA-256.
+
+The acceptance report includes:
 
 - exact-hit rate;
 - coverage histogram over all 6,561 patterns;
@@ -881,6 +925,67 @@ checkpoints not used to construct it. Report:
 - per-model and per-family distortion;
 - PTQ and QAT model-quality deltas;
 - kernel performance for its representation.
+
+For every held-out checkpoint, PTQ and QAT are each evaluated in W-only and
+W+A8 modes against a named model-scoped reference artifact on the identical
+evaluation data and task inventory. The report carries reference and candidate
+artifact/codebook hashes, CE/PPL, teacher-KL mean and p99, top-token agreement,
+task scores, and mechanically reconciled candidate-minus-reference deltas.
+
+Every claimed kernel backend supplies both decode and prefill rows. Each row
+fixes `[M,N,K]`, activation mode, output dtype, reference and candidate
+representations, device/toolchain, warmups, iterations, p20/median/p80 timing,
+oracle tolerances and observed errors, the exact universal-codebook SHA-256,
+command, and raw-run SHA-256.
+
+All distortion, quality, and latency thresholds are declared before evaluation.
+The gate document hashes the codebook, construction identities and hashes,
+held-out corpus identities, quality cases, and kernel cases while excluding
+observed outcomes. Acceptance is the conjunction of complete-universe,
+aggregate, every-model, every-family, every-quality-row, kernel-correctness, and
+decode/prefill latency checks. The implementation and CLI are
+`bitnet_train/tq1/codebook_study.py` and `quant/codebook_study.py`. A synthetic
+or incomplete report validates tooling only and is not held-out evidence.
+
+The executable corpus flow is:
+
+~~~bash
+# Run once per construction checkpoint using its own calibration statistics.
+python quant/codebook_study.py extract-corpora \
+  --role construction --model MODEL --revision IMMUTABLE_REV \
+  --statistics MODEL.calibration.safetensors \
+  --split-manifest-sha256 SPLIT_SHA256 --weighting parameter \
+  --output corpora/MODEL
+
+# Pass every construction family file with a repeated --corpus argument.
+# Equal normalization gives each model/family corpus total demand mass one.
+python quant/codebook_study.py merge-corpora --role construction \
+  --normalize-each --corpus MODEL_A/q_proj.safetensors \
+  --corpus MODEL_A/k_proj.safetensors --corpus MODEL_B/q_proj.safetensors \
+  --output construction.safetensors
+
+python quant/quant.py --codebook-source universal \
+  --codebook-corpus construction.safetensors ...
+
+# Held-out extraction is separate and cannot be consumed as construction input.
+python quant/codebook_study.py extract-corpora \
+  --role heldout --model HELDOUT --revision IMMUTABLE_REV \
+  --statistics HELDOUT.calibration.safetensors \
+  --split-manifest-sha256 SPLIT_SHA256 --weighting parameter \
+  --output corpora/HELDOUT
+~~~
+
+The merge retains the deduplicated immutable source-model identities, common
+split-manifest hash, input corpus/metadata hashes, sensitivity metric, and
+within-family weighting. Format-v1 universal production requires parameter
+weighting within each family followed by the equal-mass merge shown above.
+
+`measure` produces one exact family-metric document; `measure-model` validates a
+held-out extraction directory and emits its schema-ready seven-family aggregate.
+`coverage` produces the codebook-bound universe histogram, `definition-hash`
+freezes the planned study, `finalize` computes the verdict, and `validate`
+rechecks the complete report. The universal PTQ producer rejects a missing
+corpus or any corpus whose metadata does not declare `role=construction`.
 
 ### 9.7 Codebook validators
 
@@ -985,6 +1090,16 @@ Metadata MUST include:
 
 Statistics may be merged only by combining raw sums and counts. Averaging
 already normalized statistics is forbidden.
+
+Every production load recomputes normalized statistics from the stored FP64
+raw sums and exact token counts and requires bitwise equality with the stored
+normalized tensors. Covariance8 inputs are revalidated for finiteness,
+symmetry, and positive semidefiniteness at PTQ and QAT construction boundaries;
+an internally consistent artifact hash does not waive these numerical checks.
+Metadata uses finite standards-compliant JSON, and its normalization, absolute
+ridge-damping map, target inventory, and declared statistic tensors must
+reconcile exactly with the raw sums. The only format-v1 extra tensor class is a
+nonnegative integral token-frequency vector for a shared embedding/output head.
 
 ## 11. PTQ algorithm
 
@@ -1153,6 +1268,16 @@ fallbacks, every sweep scale, and objective before/after feedback. A failed
 Cholesky or invalid covariance is fatal unless an explicitly configured
 diagonal fallback is used; fallback use is counted per tensor.
 
+The damped block metric is prepared once per scale unit. That identical matrix
+is used for group assignment, Cholesky feedback transfers, full-block refits,
+and final candidate scoring; applying damping only inside the sweep is
+nonconformant. The implementation records the absolute damping added to every
+block, factorization failure locations, and diagonal-fallback block indices.
+All 8-lane feedback transfers are produced with Cholesky solves and reused by a
+second sweep. If either the block or one of its principal 8x8 factors fails,
+the entire block falls back to its clamped diagonal when fallback is explicitly
+enabled, keeping assignment, transfer, refit, and scoring on one metric.
+
 ### 11.6 PTQ report
 
 Every tensor report includes:
@@ -1174,6 +1299,30 @@ Every tensor report includes:
 
 The aggregate report includes parameter-weighted and tensor-family summaries.
 
+`source_scale_range` is the min/median/max of the selected analytic scale before
+runtime-dtype rounding; `rounded_scale_range` is the same inventory after exact
+runtime rounding. `underflow_count` counts selected nonzero scale units whose
+source scale is below the runtime dtype's smallest positive normal, while
+`rounding_underflow_events` also counts underflowed intermediate refits that
+were evaluated but not selected. Zero rows and zero scale units are reported
+separately, including for block-scale profiles.
+
+Shortlist reports compare shortlist and exhaustive assignment at the same
+selected runtime scale on deterministic evenly spaced positions. Strict
+profiles audit at most 256 eight-weight groups per tensor. A4 profiles audit at
+most 32 complete 32-weight affine subblocks, including the affine nibble in the
+mismatch decision. GPTQ-adjusted final indices are not substituted for the
+shortlist result in this comparison. An exhaustive production assignment
+reports that no separate comparison was performed rather than presenting a
+sampled comparison as evidence.
+
+Peak-memory fields are explicit process high-water RSS measurements from
+`getrusage`, with the pre-tensor high-water value and nonnegative delta alongside
+the absolute byte value; they are not presented as isolated allocator usage.
+Every tensor records a `projection_family`. The aggregate's
+`projection_families` map repeats the parameter-weighted metrics, count totals,
+byte totals, and reconciled candidate-oracle statistics for each family.
+
 ### 11.7 Mixed-format policy search
 
 An automatic mixed-format run uses a policy-selection split that is disjoint
@@ -1192,6 +1341,12 @@ per added physical byte. Non-improving moves stop the search. Ties choose lower
 total bytes, then the lexicographically lowest resolved tensor-name set. The
 model is re-evaluated after every accepted move; isolated per-tensor errors are
 not assumed additive.
+
+The trial cap is enforced only between complete greedy frontiers. If the
+remaining allowance cannot evaluate every legal move at the current policy,
+the search stops without evaluating or accepting any member of that frontier
+and records `trial_budget_before_complete_frontier`. Selecting the best move
+from a prefix whose membership depends on tensor ordering is nonconformant.
 
 Alternative exact knapsack, beam, or Bayesian searches are allowed when named,
 but must use the same split and budget accounting. The report retains every
@@ -1266,6 +1421,14 @@ mode builds the ordinary trit initializer from `Z_g`, uses Section 11.3's
 unique legal candidates, and then ranks them by this real-valued distance. All
 ties choose the lowest legal numerical index.
 
+For `weight_metric=iq1`, QAT recomputes the Section 11.2 factor from the
+current latent weight on every projection; a factor frozen at PTQ initialization
+is nonconformant. Covariance8 applies the resulting dynamic `D H D` metric.
+Exhaustive QAT enumerates the complete sorted legal-index set directly and does
+not route through a candidate table. In shortlist mode, shell ordering controls
+membership only: candidates are sorted numerically before objective selection
+so an equal real-valued error always chooses the lowest legal index.
+
 ### 12.3 Soft projection
 
 For each group’s top-M legal candidates:
@@ -1325,6 +1488,12 @@ Requirements:
   non-padding prediction positions as CE. This is `KL(teacher || student)` and
   must match `bitnet_train.distill`.
 - Hidden loss names exact layers and uses normalized MSE or a recorded metric.
+- Whenever hidden layers are configured with a nonzero hidden-loss weight, QAT
+  requires a live dense teacher; a sparse logit cache is insufficient. At token
+  zero and every evaluation, the trainer reruns those exact layers on the fixed
+  calibration windows, applies the same next-token non-padding mask as CE, and
+  records normalized hidden MSE both per layer and as their arithmetic mean.
+  Missing layers, shape mismatches, or an empty retained-token set fail closed.
 - If `D1 <= D2` are best and second-best candidate distances:
 
 ~~~text
@@ -1365,6 +1534,13 @@ Entry requires:
 - acceptable assignment margins;
 - no dead-codeword or scale pathology requiring intervention.
 
+Every observation used for entry must contain finite CE and teacher KL. The
+token-domain schedule also declares a maximum per-tensor zero fraction and a
+maximum aggregate scale-underflow count; missing values fail their gates. The
+canonical defaults are `0.95` and `0`, respectively. A checkpoint written
+before these observations became part of controller history cannot be silently
+resumed under the stronger gate contract.
+
 A configured freeze-token position is the earliest eligibility point, not
 permission to bypass these gates. If the gates are unmet at the configured
 maximum hard-phase token position, the run stops unsuccessfully, saves its exact
@@ -1402,6 +1578,36 @@ At token zero and every declared evaluation interval, record per tensor and aggr
 
 Frozen indices changing is a fatal error.
 
+The trainer writes `tq1_health.jsonl` at token zero and at every declared
+evaluation (including freeze-gate evaluations). Each schema-1 record binds the
+QuantSpec hash and global token/step position and contains the complete
+per-tensor panel, a reconciled aggregate, the controller state, model-evaluation
+metrics, and the most recent training loss components. Text or other
+non-numeric diagnostics cannot be smuggled into the numeric model/training
+metric maps.
+
+The model metric map stores fixed-calibration hidden alignment as
+`hidden_normalized_mse` plus `hidden_normalized_mse_L<layer>` for every selected
+layer. These are evaluation measurements; the similarly named training-loss
+component is not a substitute for them.
+
+Changed-trit histograms contain all bins 0 through 8 and must sum to the group
+count. The aggregate histogram is an exact sum, so its mean and exact-hit rate
+are recomputed rather than averaged. Index flips, underflows, newly activated
+codewords, retired codewords, and weighted projection/source energy are also
+summed before their aggregate rates are computed. Trit fractions, entropy, and
+per-tensor quantiles use explicit group weighting. Aggregate `margin_p05` is the
+minimum tensor p05 (the conservative freeze-gate value); aggregate p50/p95 are
+named `*_tensor_weighted` to avoid presenting averages of quantiles as global
+quantiles. Scale minima/maxima are extrema across tensors and median summaries
+are likewise labeled tensor-weighted.
+
+Frozen-phase health recomputes a diagnostic hard assignment without mutating
+the serialized frozen indices. It reports disagreement with those indices and
+fails immediately if the frozen inventory itself changed. The deployed frozen
+indices remain the source for changed-trit, codeword-use, and weighted-error
+metrics.
+
 ### 12.8 Training-stack integration
 
 TQ1 must extend the existing `ArchProfile.quant` data model rather than create
@@ -1429,6 +1635,13 @@ Checkpoints MUST include:
 FSDP saves MUST use a gathered full state dict or the framework’s distributed
 checkpoint API. Rank-zero `save_pretrained` on a sharded module is not
 conformant.
+
+Non-uniform QAT loading requires the calibration-statistics artifact named by
+the training profile. Its file SHA-256 must equal the hash bound into the PTQ
+artifact; absent or different statistics are fatal rather than silently
+becoming uniform importance. Block256 PTQ supplies its diagonal companion to
+the groupwise QAT assignment, since format-v1 QAT does not implement a
+cross-group 256-lane assignment objective.
 
 ## 13. Canonical artifact
 
@@ -1854,6 +2067,8 @@ quant:
   freeze_eval_every_tokens: 16777216
   freeze_indices_at_tokens: 167772160
   freeze_max_tokens: 184549376
+  freeze_max_zero_fraction: 0.95
+  freeze_max_scale_underflows: 0
   margin: 0.1
   lambda_margin: 0.0
   tensor_overrides: []
@@ -1866,8 +2081,8 @@ tokens, never optimizer steps. Before loading model weights, the trainer MUST
 verify that the total token budget reaches `freeze_max_tokens`, that every phase
 and observation boundary is exactly divisible by the run's global
 tokens-per-step, and that the hard phase contains at least
-`freeze_sustain_evals` observations. Checkpoints use the token-domain controller
-schema and record the exact global token position and most recent observation
+`freeze_sustain_evals` observations. Checkpoints use token-domain controller
+schema 3 and record the exact global token position and most recent observation
 position. Legacy step-domain controller checkpoints are not implicitly migrated.
 
 ### 16.3 Export and verification
@@ -2033,6 +2248,12 @@ Every released result records:
 - complete commands;
 - artifact and GGUF hashes;
 - evaluation dataset revisions and exclusions.
+
+For canonical PTQ and QAT artifacts, executable source hashes recursively cover
+the TQ1 implementation, public quantization and export entry points, native CPU
+and Metal kernel trees, and the pinned llama.cpp integration patch and tests.
+Provenance identifies the C/C++ and Python compilers, available accelerator
+inventory, and the fact that format-v1 PTQ assignment itself executes on CPU.
 
 Sensitive production calibration data is not committed. A redacted manifest may
 be committed only if it does not expose prompts, identifiers, secrets, or
@@ -2378,4 +2599,7 @@ passes capability gates. QI-4 remains optional until its linked calibration and
 evaluation reports exist. QI-5 speed/energy promotion requires the model-level
 report in Section 27 in addition to kernel A/Bs. QI-6 remains disabled unless an
 actual named workload produces an eligible cost decision and its service report
-passes. Synthetic unit fixtures prove contract behavior only.
+passes. The Section 9.6 universal-codebook metric and acceptance tooling is
+implemented, but no universal codebook is accepted until real disjoint
+construction/held-out corpora, PTQ/QAT comparisons, and kernel runs populate a
+passing report. Synthetic unit fixtures prove contract behavior only.

@@ -45,7 +45,9 @@ def test_schedule_is_exact_and_resume_freezes_only_after_gates():
     assert module.phase == "hard"
     controller.after_step(40)
     first = controller.observe(40, {
-        "flip_total": 0.001, "tq1_margin_p05": 0.2, "val_ce_primary": 2.0})
+        "flip_total": 0.001, "tq1_margin_p05": 0.2, "val_ce_primary": 2.0,
+        "kl_tf": 0.1, "tq1_zero_fraction_max": 0.5,
+        "tq1_scale_underflow_count": 0})
     assert not first["transitioned"]
     saved = controller.state_dict()
     module_checkpoint = module.state_dict()
@@ -58,13 +60,17 @@ def test_schedule_is_exact_and_resume_freezes_only_after_gates():
     resumed.before_step(40)
     resumed.after_step(50)
     result = resumed.observe(50, {
-        "flip_total": 0.001, "tq1_margin_p05": 0.2, "val_ce_primary": 2.01})
+        "flip_total": 0.001, "tq1_margin_p05": 0.2, "val_ce_primary": 2.01,
+        "kl_tf": 0.1, "tq1_zero_fraction_max": 0.5,
+        "tq1_scale_underflow_count": 0})
     assert result["transitioned"] and resumed_module.phase == "frozen"
     resumed.assert_export_qualified()
     controller.before_step(40)
     controller.after_step(50)
     uninterrupted = controller.observe(50, {
-        "flip_total": 0.001, "tq1_margin_p05": 0.2, "val_ce_primary": 2.01})
+        "flip_total": 0.001, "tq1_margin_p05": 0.2, "val_ce_primary": 2.01,
+        "kl_tf": 0.1, "tq1_zero_fraction_max": 0.5,
+        "tq1_scale_underflow_count": 0})
     assert uninterrupted["transitioned"]
     assert resumed.state_dict() == controller.state_dict()
     assert torch.equal(resumed_module.indices, module.indices)
@@ -85,7 +91,9 @@ def test_schedule_is_world_size_invariant_and_rejects_misalignment():
             if controller.observation_due(tokens + tokens_per_step):
                 event = controller.observe(tokens + tokens_per_step, {
                     "flip_total": 0.0, "tq1_margin_p05": 1.0,
-                    "val_ce_primary": 1.0, "kl_tf": 0.0})
+                    "val_ce_primary": 1.0, "kl_tf": 0.0,
+                    "tq1_zero_fraction_max": 0.5,
+                    "tq1_scale_underflow_count": 0})
                 if event["transitioned"]:
                     transitions.append(tokens + tokens_per_step)
                     break
@@ -103,16 +111,37 @@ def test_schedule_rejects_impossible_run_and_legacy_checkpoint():
     controller = QATController([_module()], schedule)
     with pytest.raises(ValueError, match="legacy step-domain"):
         controller.load_state_dict({"schema": 1})
+    with pytest.raises(ValueError, match="lacks fail-closed health-gate"):
+        controller.load_state_dict({"schema": 2})
 
     for tokens in range(0, 100, 20):
         controller.before_step(tokens)
         controller.after_step(tokens + 20)
         controller.observe(tokens + 20, {
             "flip_total": 1.0, "tq1_margin_p05": 0.0,
-            "val_ce_primary": 1.0, "kl_tf": 0.0})
+            "val_ce_primary": 1.0, "kl_tf": 0.0,
+            "tq1_zero_fraction_max": 0.5,
+            "tq1_scale_underflow_count": 0})
     assert controller.failure_reason == "freeze gates unmet: flip"
     with pytest.raises(RuntimeError, match="freeze gates unmet"):
         controller.before_step(100)
+
+
+def test_freeze_gates_fail_closed_without_kl_or_with_scale_pathology():
+    schedule = QATSchedule(
+        soft_tokens=10, hard_tokens=10, freeze_eval_every_tokens=10,
+        freeze_max_tokens=30, sustain_evals=1)
+    controller = QATController([_module()], schedule)
+    for position in (10, 20):
+        controller.before_step(position - 10)
+        controller.after_step(position)
+        result = controller.observe(position, {
+            "flip_total": 0.0, "tq1_margin_p05": 1.0,
+            "val_ce_primary": 1.0, "tq1_zero_fraction_max": 0.5,
+            "tq1_scale_underflow_count": 1 if position == 20 else 0})
+    assert result["freeze_gates"]["trend"] is False
+    assert result["freeze_gates"]["health"] is False
+    assert not result["transitioned"]
 
 
 def test_canonical_200m_profile_is_feasible_for_one_two_and_four_processes():

@@ -10,6 +10,55 @@ from .codebook import Codebook
 from .packing import layout, unpack_payload
 
 
+def _validate_scales(scales: torch.Tensor, name: str, *, embedded: bool = False) \
+        -> torch.Tensor:
+    legal_dtypes = {torch.float16} if embedded else {torch.float16, torch.bfloat16}
+    if scales.dtype not in legal_dtypes:
+        expected = "float16" if embedded else "float16 or bfloat16"
+        raise ValueError(f"{name} must use {expected} runtime storage")
+    value = scales.detach().cpu()
+    if not torch.isfinite(value).all() or torch.any(value < 0):
+        raise ValueError(f"{name} must be finite and nonnegative")
+    return value
+
+
+def _cast_finite_output(value: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    result = value.to(dtype)
+    if not torch.isfinite(result).all():
+        raise ValueError("TQ1 oracle output overflows the requested dtype")
+    return result
+
+
+def validate_scale_index_invariants(
+        indices: torch.Tensor, scales: torch.Tensor, codebook: Codebook, *,
+        block_scales: bool, affine_nibbles: torch.Tensor | None = None) -> None:
+    """Require every zero-scale unit to use its canonical zero representation."""
+    legal = codebook.legal_index_mask()
+    physical = torch.arange(codebook.index_count, dtype=torch.int64)
+    zero = torch.nonzero(
+        (codebook.decode(physical) == 0).all(-1) & legal).flatten()
+    if zero.numel() != 1:
+        raise ValueError("codebook does not have exactly one legal zero index")
+    zero_index = int(zero[0])
+    if block_scales:
+        blocks = scales.shape[-1]
+        grouped = indices.reshape(-1, blocks, 32)
+        mask = scales.reshape(-1, blocks) == 0
+        if torch.any(grouped[mask] != zero_index):
+            raise ValueError("zero-scale block contains a nonzero codebook index")
+        if affine_nibbles is not None:
+            raise ValueError("format-v1 block scales cannot carry A4 metadata")
+        return
+    grouped = indices.reshape(scales.numel(), -1)
+    mask = scales.reshape(-1) == 0
+    if torch.any(grouped[mask] != zero_index):
+        raise ValueError("zero-scale row contains a nonzero codebook index")
+    if affine_nibbles is not None:
+        affine = affine_nibbles.reshape(scales.numel(), -1)
+        if torch.any(affine[mask] != 0):
+            raise ValueError("zero-scale row contains nonzero A4 metadata")
+
+
 @dataclass(frozen=True)
 class ActivationCodes:
     codes: torch.Tensor
@@ -66,6 +115,12 @@ def decode_normalized(payload: torch.Tensor, profile: str, codebook: Codebook) \
     _validate_profile_codebook(profile, codebook)
     indices, block_scales, affine = unpack_payload(payload, profile)
     codebook.validate_indices(indices)
+    if block_scales is not None:
+        block_scales = _validate_scales(
+            block_scales, "embedded block scales", embedded=True)
+        validate_scale_index_invariants(
+            indices, block_scales, codebook, block_scales=True,
+            affine_nibbles=affine)
     codewords = codebook.decode(indices)
     if affine is None:
         return codewords, block_scales
@@ -88,14 +143,22 @@ def dequantize_weight(payload: torch.Tensor, profile: str, codebook: Codebook, *
     if layout(profile).scale_mode == "row":
         if row_scales is None or tuple(row_scales.shape) != tuple(normalized.shape[:-2]):
             raise ValueError("row profile requires one scale per logical output row")
-        scale = row_scales.detach().float().cpu()[..., None, None]
+        row_scales = _validate_scales(row_scales, "row scales")
+        indices, _, affine = unpack_payload(payload, profile)
+        validate_scale_index_invariants(
+            indices, row_scales, codebook, block_scales=False,
+            affine_nibbles=affine)
+        scale = row_scales.float()[..., None, None]
         weight = normalized.float() * scale
     else:
         if row_scales is not None or block_scales is None:
             raise ValueError("block profile takes scales only from its payload")
         scale = block_scales.float().repeat_interleave(32, dim=-1)[..., None]
         weight = normalized.float() * scale
-    return weight.reshape(*weight.shape[:-2], -1)
+    result = weight.reshape(*weight.shape[:-2], -1)
+    if not torch.isfinite(result).all():
+        raise ValueError("decoded weight contains NaN or infinity")
+    return result
 
 
 def _strict_group_dots(codes: torch.Tensor, codewords: torch.Tensor) -> torch.Tensor:
@@ -109,6 +172,8 @@ def linear_w2a8(x: torch.Tensor, payload: torch.Tensor, profile: str,
                 activation_mode: str = "a8_token",
                 output_dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Execute a logical 2-D weight matrix through the scalar packed oracle."""
+    if output_dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError("TQ1 oracle output dtype must be float16, bfloat16, or float32")
     if payload.ndim != 3:
         raise ValueError("linear oracle currently requires payload [N,K/256,bytes]")
     original_shape = x.shape[:-1]
@@ -119,6 +184,12 @@ def linear_w2a8(x: torch.Tensor, payload: torch.Tensor, profile: str,
     q = activation.codes.reshape(x2.shape[0], -1, 8)
     indices, block_scales, affine = unpack_payload(payload, profile)
     codebook.validate_indices(indices)
+    if block_scales is not None:
+        block_scales = _validate_scales(
+            block_scales, "embedded block scales", embedded=True)
+        validate_scale_index_invariants(
+            indices, block_scales, codebook, block_scales=True,
+            affine_nibbles=affine)
     codewords = codebook.decode(indices)
     if codewords.shape[1] * 8 != x2.shape[1]:
         raise ValueError("activation width and packed weight width disagree")
@@ -150,7 +221,11 @@ def linear_w2a8(x: torch.Tensor, payload: torch.Tensor, profile: str,
     if spec.scale_mode == "row":
         if row_scales is None or tuple(row_scales.shape) != (payload.shape[0],):
             raise ValueError("row profile requires [N] companion scales")
-        weight_scale = row_scales.detach().float().cpu()[None]
+        row_scales = _validate_scales(row_scales, "row scales")
+        validate_scale_index_invariants(
+            indices, row_scales, codebook, block_scales=False,
+            affine_nibbles=affine)
+        weight_scale = row_scales.float()[None]
         if activation_mode == "a8_token":
             if acc.ndim == 3:
                 acc = acc.sum(-1, dtype=torch.int32).float()
@@ -171,12 +246,23 @@ def linear_w2a8(x: torch.Tensor, payload: torch.Tensor, profile: str,
         else:
             out = (block_acc * block_scales[None].float()
                    * activation.scales[:, None]).sum(-1)
-    return out.to(output_dtype).reshape(*original_shape, payload.shape[0])
+    if not torch.isfinite(out).all():
+        raise ValueError("TQ1 oracle output contains NaN or infinity")
+    return _cast_finite_output(out, output_dtype).reshape(
+        *original_shape, payload.shape[0])
 
 
 def linear_w_only(x: torch.Tensor, payload: torch.Tensor, profile: str,
                   codebook: Codebook, *, row_scales: torch.Tensor | None = None,
                   output_dtype: torch.dtype | None = None) -> torch.Tensor:
+    value = x.detach().float().cpu()
+    if not torch.isfinite(value).all():
+        raise ValueError("activation contains NaN or infinity")
+    dtype = output_dtype or x.dtype
+    if dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError("TQ1 oracle output dtype must be float16, bfloat16, or float32")
     weight = dequantize_weight(payload, profile, codebook, row_scales=row_scales)
-    result = torch.nn.functional.linear(x.detach().float().cpu(), weight)
-    return result.to(output_dtype or x.dtype)
+    result = torch.nn.functional.linear(value, weight)
+    if not torch.isfinite(result).all():
+        raise ValueError("TQ1 oracle output contains NaN or infinity")
+    return _cast_finite_output(result, dtype)

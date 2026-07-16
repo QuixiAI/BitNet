@@ -36,6 +36,8 @@ def schedule_from_config(config: Mapping[str, Any]) -> "QATSchedule":
         margin_threshold=float(config.get("freeze_margin_threshold", 0.0)),
         sustain_evals=config.get("freeze_sustain_evals", 3),
         trend_tolerance=float(config.get("freeze_trend_tolerance", 0.01)),
+        max_zero_fraction=float(config.get("freeze_max_zero_fraction", 0.95)),
+        max_scale_underflows=config.get("freeze_max_scale_underflows", 0),
     )
 
 
@@ -53,6 +55,8 @@ class QATSchedule:
     margin_threshold: float = 0.0
     sustain_evals: int = 3
     trend_tolerance: float = 0.01
+    max_zero_fraction: float = 0.95
+    max_scale_underflows: int = 0
 
     def __post_init__(self) -> None:
         if self.initial_phase not in {"soft", "hard", "frozen"}:
@@ -82,6 +86,13 @@ class QATSchedule:
         if not all(math.isfinite(value) and value >= 0 for value in (
                 self.flip_threshold, self.margin_threshold, self.trend_tolerance)):
             raise ValueError("QAT freeze thresholds must be finite and nonnegative")
+        if not math.isfinite(self.max_zero_fraction) \
+                or not 0 <= self.max_zero_fraction <= 1:
+            raise ValueError("max_zero_fraction must be in [0,1]")
+        if isinstance(self.max_scale_underflows, bool) \
+                or not isinstance(self.max_scale_underflows, int) \
+                or self.max_scale_underflows < 0:
+            raise ValueError("max_scale_underflows must be a nonnegative integer")
         for name, value in (("freeze_indices_at_tokens", self.freeze_indices_at_tokens),
                             ("freeze_max_tokens", self.freeze_max_tokens)):
             if value is not None and (isinstance(value, bool)
@@ -218,17 +229,26 @@ class QATController:
         count = self.schedule.sustain_evals
         recent = self.history[-count:]
         enough = len(recent) == count
-        flips = enough and all(item["flip_rate"] <= self.schedule.flip_threshold
+        flips = enough and all(0 <= item["flip_rate"] <= self.schedule.flip_threshold
                                for item in recent)
-        margins = enough and all(item["margin_p05"] >= self.schedule.margin_threshold
+        margins = enough and all(math.isfinite(item["margin_p05"])
+                                 and item["margin_p05"] >= self.schedule.margin_threshold
                                  for item in recent)
-        trend = enough
-        if enough:
+        trend = enough and all(
+            math.isfinite(item[key]) for item in recent for key in ("val_ce", "kl_tf"))
+        if trend:
             for key in ("val_ce", "kl_tf"):
-                values = [item[key] for item in recent if math.isfinite(item[key])]
-                if len(values) >= 2 and values[-1] > values[0] + self.schedule.trend_tolerance:
+                values = [item[key] for item in recent]
+                if values[-1] > values[0] + self.schedule.trend_tolerance:
                     trend = False
-        gates = {"sustained": enough, "flip": flips, "margin": margins, "trend": trend}
+        health = enough and all(
+            0 <= item["zero_fraction_max"] <= self.schedule.max_zero_fraction
+            and 0 <= item["scale_underflow_count"] <= self.schedule.max_scale_underflows
+            for item in recent)
+        gates = {
+            "sustained": enough, "flip": flips, "margin": margins,
+            "trend": trend, "health": health,
+        }
         return all(gates.values()), gates
 
     def observe(self, tokens_seen: int, metrics: Mapping[str, Any]) -> dict[str, Any]:
@@ -241,6 +261,10 @@ class QATController:
             "margin_p05": float(metrics.get("tq1_margin_p05", -math.inf)),
             "val_ce": float(metrics.get("val_ce_primary", math.nan)),
             "kl_tf": float(metrics.get("kl_tf", math.nan)),
+            "zero_fraction_max": float(
+                metrics.get("tq1_zero_fraction_max", math.inf)),
+            "scale_underflow_count": float(
+                metrics.get("tq1_scale_underflow_count", math.inf)),
         }
         self.history.append(record)
         self.last_observation_tokens = tokens_seen
@@ -279,7 +303,7 @@ class QATController:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "schema": 2,
+            "schema": 3,
             "domain": "global_tokens",
             "schedule": asdict(self.schedule),
             "history": [dict(item) for item in self.history],
@@ -295,7 +319,10 @@ class QATController:
             raise ValueError(
                 "legacy step-domain QAT checkpoint is not resumable under the "
                 "token-domain schedule")
-        if state.get("schema") != 2 or state.get("domain") != "global_tokens":
+        if state.get("schema") == 2:
+            raise ValueError(
+                "controller schema 2 lacks fail-closed health-gate observations")
+        if state.get("schema") != 3 or state.get("domain") != "global_tokens":
             raise ValueError("unsupported QAT controller checkpoint schema")
         if QATSchedule(**state["schedule"]) != self.schedule:
             raise ValueError("QAT schedule differs from the checkpoint")
@@ -304,7 +331,10 @@ class QATController:
             if module.phase != phase:
                 module.set_phase(phase)
         raw_history = state.get("history", [])
-        history_keys = {"tokens", "flip_rate", "margin_p05", "val_ce", "kl_tf"}
+        history_keys = {
+            "tokens", "flip_rate", "margin_p05", "val_ce", "kl_tf",
+            "zero_fraction_max", "scale_underflow_count",
+        }
         if not isinstance(raw_history, list):
             raise ValueError("checkpoint QAT history must be a list")
         self.history = []

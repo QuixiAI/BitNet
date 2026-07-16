@@ -13,6 +13,7 @@ SPEC_REVISION = "1.0.0"
 ARTIFACT_SCHEMA = 2
 FORMAT_VERSION = 1
 GGML_TYPE_REGISTRY_REVISION = 1
+IQ1_CODEBOOK_SHA256 = "1edfeb295366968940d5d4397dc046110f851acb59de9407fdf0c06982adaa72"
 
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
@@ -124,12 +125,16 @@ class CodebookRef:
             raise ValueError(f"invalid codebook format {self.format!r}")
         if self.encoding not in {"sign_canonical", "direct_joint", "product"}:
             raise ValueError(f"invalid codebook encoding {self.encoding!r}")
-        if self.scope not in {"universal", "model", "iq1", "loaded"}:
+        if self.scope not in {"universal", "model", "iq1"}:
             raise ValueError(f"invalid codebook scope {self.scope!r}")
         if _HASH_RE.fullmatch(self.sha256) is None:
             raise ValueError("codebook sha256 must be 64 lowercase hex characters")
         if self.encoding == "direct_joint" and self.format != "v11":
             raise ValueError("the format-v1 IQ1 direct grid is V11 only")
+        if self.scope == "iq1" and (
+                self.encoding != "direct_joint" or self.format != "v11"
+                or self.sha256 != IQ1_CODEBOOK_SHA256):
+            raise ValueError("iq1 scope is reserved for the pinned direct-joint grid")
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "CodebookRef":
@@ -266,6 +271,19 @@ class QuantSpec:
                 if book is None:
                     raise ValueError(f"tensor rule references unknown codebook {rule.codebook_id!r}")
                 self._validate_profile_codebook(rule.profile, book)
+        resolved_tq1_profiles = {
+            self.default_profile,
+            *(rule.profile for rule in self.tensor_overrides
+              if rule.profile in TQ1_PROFILES),
+        }
+        if self.gptq_feedback and any("-a4-" in profile
+                                      for profile in resolved_tq1_profiles):
+            raise ValueError("GPTQ feedback cannot be combined with an A4 tensor override")
+        if self.qat_projection != "none" and any(
+                profile.endswith("-b") or "-a4-" in profile
+                for profile in resolved_tq1_profiles):
+            raise ValueError(
+                "format-v1 QAT supports only J/I/P external-row-scale profiles")
         if not isinstance(self.shared_embedding_head, bool):
             raise ValueError("shared_embedding_head must be boolean")
         for name, value in (("shared_head_importance", self.shared_head_importance),
@@ -286,6 +304,9 @@ class QuantSpec:
                 f"profile {profile!r} is incompatible with codebook {book.id!r} "
                 f"({book.format}/{book.encoding})"
             )
+        if expected_encoding == "direct_joint" \
+                and (book.scope != "iq1" or book.sha256 != IQ1_CODEBOOK_SHA256):
+            raise ValueError("format-v1 direct-joint profiles require the pinned IQ1 grid")
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "QuantSpec":

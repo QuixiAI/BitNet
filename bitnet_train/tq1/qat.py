@@ -6,7 +6,7 @@ import math
 import json
 import weakref
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +16,7 @@ from .codebook import Codebook, base3_ids
 from .oracle import quantize_activation
 from .packing import pack_payload
 from .ptq import PTQResult, candidate_table
-from .spec import QuantSpec
+from .spec import TQ1_PROFILES, QuantSpec
 
 
 _PHASES = {"soft": 0, "hard": 1, "frozen": 2}
@@ -68,10 +68,25 @@ class TQ1Linear(nn.Module):
         super().__init__()
         if latent_weight.ndim != 2 or latent_weight.shape[1] % 256:
             raise ValueError("TQ1Linear latent weight must be [N,K], K divisible by 256")
+        if latent_weight.dtype not in {torch.float16, torch.bfloat16, torch.float32} \
+                or not torch.isfinite(latent_weight).all():
+            raise ValueError("TQ1Linear latent weight has an unsupported dtype or value")
         if tuple(row_scales.shape) != (latent_weight.shape[0],):
             raise ValueError("TQ1Linear requires one initial scale per output row")
+        if not row_scales.is_floating_point() or not torch.isfinite(row_scales).all() \
+                or torch.any(row_scales < 0):
+            raise ValueError("TQ1Linear initial row scales must be finite and nonnegative")
+        source_zero_rows = (latent_weight == 0).all(1)
+        if torch.any(source_zero_rows != (row_scales == 0)):
+            raise ValueError("TQ1Linear zero-row and zero-scale inventories disagree")
         if phase not in _PHASES or "-b" in profile or "-a4-" in profile:
             raise ValueError("format-v1 QAT supports soft/hard/frozen J/I/P row profiles")
+        declared_profiles = {quant_spec.default_profile} | {
+            rule.profile for rule in quant_spec.tensor_overrides
+            if rule.profile in TQ1_PROFILES
+        }
+        if profile not in declared_profiles:
+            raise ValueError("QAT profile is not declared by the canonical QuantSpec")
         if not 1 <= top_m <= quant_spec.candidate_count:
             raise ValueError("top_m must be in [1,candidate_count]")
         if not math.isfinite(temperature) or temperature <= 0:
@@ -82,6 +97,12 @@ class TQ1Linear(nn.Module):
             "product" if "-p-" in profile else "sign_canonical"
         if codebook.encoding != expected or codebook.index_format not in profile:
             raise ValueError("QAT profile and codebook disagree")
+        try:
+            registered_codebook = quant_spec.codebook(codebook.id)
+        except KeyError as exc:
+            raise ValueError("QAT codebook is absent from the canonical QuantSpec") from exc
+        if registered_codebook != codebook.ref():
+            raise ValueError("QAT codebook identity differs from the canonical QuantSpec")
 
         # Keep the ordinary ``weight`` state-dict key so a gathered HF checkpoint
         # can still seed the architecture before distributed TQ1 state is restored.
@@ -96,7 +117,9 @@ class TQ1Linear(nn.Module):
         self.register_buffer("decoded_table", codebook.decode(
             torch.arange(codebook.index_count)).to(torch.int8).clone())
         self.register_buffer("legal_mask", codebook.legal_index_mask().clone())
-        candidates = candidate_table(codebook, quant_spec.candidate_count)
+        candidates = (candidate_table(codebook, quant_spec.candidate_count)
+                      if quant_spec.assignment_mode == "shortlist"
+                      else torch.empty((0, 0), dtype=torch.int64))
         self.register_buffer("candidate_indices", candidates.clone())
         groups = latent_weight.shape[1] // 8
         if initial_indices is None:
@@ -112,13 +135,37 @@ class TQ1Linear(nn.Module):
         self.zero_index = int(zero_index)
         self.register_buffer("indices", initial_indices)
         self.register_buffer("frozen_reference", torch.empty(0, dtype=torch.int64))
-        if importance_diag is None:
-            importance_diag = torch.ones(latent_weight.shape[1])
+        if quant_spec.importance_mode == "uniform":
+            if importance_cov8 is not None:
+                raise ValueError("uniform QAT cannot carry covariance importance")
+            if importance_diag is None:
+                importance_diag = torch.ones(latent_weight.shape[1])
+        elif quant_spec.importance_mode == "covariance8":
+            if importance_cov8 is None:
+                raise ValueError("covariance8 QAT requires covariance statistics")
+            if importance_diag is None:
+                importance_diag = importance_cov8.diagonal(
+                    dim1=-2, dim2=-1).reshape(-1)
+        elif importance_diag is None:
+            raise ValueError(
+                f"{quant_spec.importance_mode} QAT requires diagonal statistics")
         if tuple(importance_diag.shape) != (latent_weight.shape[1],):
             raise ValueError("QAT diagonal importance shape mismatch")
+        if not torch.isfinite(importance_diag).all() or torch.any(importance_diag < 0):
+            raise ValueError("QAT diagonal importance is invalid")
         self.register_buffer("importance_diag", importance_diag.detach().float().reshape(-1, 8))
         if importance_cov8 is not None and tuple(importance_cov8.shape) != (groups, 8, 8):
             raise ValueError("QAT covariance8 shape mismatch")
+        if importance_cov8 is not None and (not torch.isfinite(importance_cov8).all()
+                                            or not torch.allclose(
+                                                importance_cov8, importance_cov8.transpose(-1, -2),
+                                                atol=1e-6, rtol=1e-6)):
+            raise ValueError("QAT covariance8 importance is invalid")
+        if importance_cov8 is not None:
+            minimum = float(torch.linalg.eigvalsh(
+                importance_cov8.detach().float().cpu()).min())
+            if minimum < -1e-6:
+                raise ValueError("QAT covariance8 importance is not positive semidefinite")
         self.register_buffer("importance_cov8", None if importance_cov8 is None
                              else importance_cov8.detach().float().clone())
         self.profile = profile
@@ -130,6 +177,9 @@ class TQ1Linear(nn.Module):
         self.codebook_id = codebook.id
         self.codebook_sha256 = codebook.sha256()
         self.codebook_encoding = codebook.encoding
+        self.assignment_mode = quant_spec.assignment_mode
+        self.weight_metric = quant_spec.weight_metric
+        self.importance_mode = quant_spec.importance_mode
         self.top_m = int(top_m)
         self.assignment_chunk = int(assignment_chunk)
         self._cached_versions: tuple[int, int, int] | None = None
@@ -206,13 +256,26 @@ class TQ1Linear(nn.Module):
         self._cached_versions = None
 
     def _distances(self, target: torch.Tensor, candidates: torch.Tensor,
-                   group_ids: torch.Tensor) -> torch.Tensor:
+                   group_ids: torch.Tensor,
+                   iq1_factor: torch.Tensor | None = None) -> torch.Tensor:
         delta = target[:, None] - candidates
         if self.importance_cov8 is None:
             diag = self.importance_diag[group_ids]
+            if iq1_factor is not None:
+                diag = diag * iq1_factor
             return (delta.square() * diag[:, None]).sum(-1)
         covariance = self.importance_cov8[group_ids]
+        if iq1_factor is not None:
+            root = torch.sqrt(iq1_factor)
+            covariance = covariance * root[:, :, None] * root[:, None, :]
         return torch.einsum("mci,mij,mcj->mc", delta, covariance, delta)
+
+    def _iq1_factor(self, latent: torch.Tensor) -> torch.Tensor | None:
+        if self.weight_metric == "uniform":
+            return None
+        blocks = latent.float().reshape(self.out_features, -1, 256)
+        sigma2 = 2.0 * blocks.square().mean(-1, keepdim=True)
+        return torch.sqrt(sigma2 + blocks.square()).reshape(-1, 8)
 
     def _project(self, alpha: torch.Tensor, *, soft: bool) -> ProjectionState:
         rows, groups = self.out_features, self.in_features // 8
@@ -227,16 +290,28 @@ class TQ1Linear(nn.Module):
         group_ids = torch.arange(groups, device=latent.device).repeat(rows)
         normalized = flat_target / alpha[row_ids, None].clamp_min(1e-30)
         initializer = torch.round(normalized).clamp(-1, 1).to(torch.int8)
-        choice_table = self.candidate_indices.to(latent.device)
-        choices = choice_table[base3_ids(initializer).to(latent.device)]
         decoded_table = self.decoded_table.to(latent.device)
+        iq1_factor = self._iq1_factor(latent)
+        legal_indices = (torch.nonzero(self.legal_mask).flatten().to(latent.device)
+                         if self.assignment_mode == "exhaustive" else None)
+        choice_table = (self.candidate_indices.to(latent.device)
+                        if self.assignment_mode == "shortlist" else None)
+        initializer_ids = (base3_ids(initializer).to(latent.device)
+                           if choice_table is not None else None)
         for start in range(0, flat_target.shape[0], self.assignment_chunk):
             stop = min(start + self.assignment_chunk, flat_target.shape[0])
-            selected = choices[start:stop]
+            if legal_indices is not None:
+                selected = legal_indices[None].expand(stop - start, -1)
+            else:
+                assert choice_table is not None and initializer_ids is not None
+                selected = choice_table[initializer_ids[start:stop]]
+                selected = torch.sort(selected, dim=1).values
             words = decoded_table[selected].to(latent.dtype)
             scaled = words * alpha[row_ids[start:stop], None, None]
             distances = self._distances(flat_target[start:stop], scaled,
-                                        group_ids[start:stop])
+                                        group_ids[start:stop],
+                                        None if iq1_factor is None
+                                        else iq1_factor[start:stop])
             ordered = torch.argsort(distances, dim=1, stable=True)
             hard_pos = ordered[:, 0]
             hard_indices = selected.gather(1, hard_pos[:, None]).squeeze(1)
@@ -316,27 +391,123 @@ class TQ1Linear(nn.Module):
                           - (state.second_distance - state.best_distance)).mean()
 
     @torch.no_grad()
-    def health(self, previous_indices: torch.Tensor | None = None) -> dict[str, float]:
+    def health(self, previous_indices: torch.Tensor | None = None) -> dict[str, Any]:
         alpha = self.runtime_scales()
         state = self.projection(alpha)
-        counts = torch.bincount(state.indices.flatten(), minlength=self.decoded_table.shape[0]).float()
+        diagnostic_state = self._project(alpha, soft=False) if self.phase == "frozen" else state
+        counts = torch.bincount(
+            state.indices.flatten(), minlength=self.decoded_table.shape[0]).float()
         probabilities = counts[counts > 0] / counts.sum()
         hard_words = self.decoded_table[state.indices]
+        source_alpha = F.softplus(self.scale_parameter)
+        source_alpha = torch.where(
+            self.zero_rows, torch.zeros_like(source_alpha), source_alpha)
+        divisor = torch.where(alpha > 0, alpha, torch.ones_like(alpha))[:, None, None]
+        scalar = torch.round(
+            self.latent_weight.reshape_as(hard_words) / divisor).clamp(-1, 1).to(torch.int8)
+        scalar[self.zero_rows] = 0
+        changed = (hard_words != scalar).sum(-1)
+        margin = (diagnostic_state.second_distance
+                  - diagnostic_state.best_distance).float().flatten()
+        delta = (alpha[:, None, None] * hard_words.to(self.latent_weight.dtype)
+                 - self.latent_weight.reshape_as(hard_words)).float()
+        latent = self.latent_weight.detach().float().reshape_as(delta)
+        iq1_factor = self._iq1_factor(latent)
+        if iq1_factor is not None:
+            iq1_factor = iq1_factor.reshape_as(delta)
+        if self.importance_cov8 is None:
+            metric = self.importance_diag.float()[None]
+            if iq1_factor is not None:
+                metric = metric * iq1_factor
+            weighted_error = float((delta.square() * metric).sum())
+            weighted_source = float((latent.square() * metric).sum())
+        else:
+            covariance = self.importance_cov8.float()
+            if iq1_factor is None:
+                weighted_error = float(torch.einsum(
+                    "rgi,gij,rgj->", delta, covariance, delta))
+                weighted_source = float(torch.einsum(
+                    "rgi,gij,rgj->", latent, covariance, latent))
+            else:
+                root = torch.sqrt(iq1_factor)
+                covariance = (covariance[None] * root[..., :, None]
+                              * root[..., None, :])
+                weighted_error = float(torch.einsum(
+                    "rgi,rgij,rgj->", delta, covariance, delta))
+                weighted_source = float(torch.einsum(
+                    "rgi,rgij,rgj->", latent, covariance, latent))
+        previous_counts = None
+        index_flip_count = newly_activated = retired = 0
+        if previous_indices is not None:
+            if previous_indices.dtype == torch.bool \
+                    or previous_indices.is_floating_point() \
+                    or previous_indices.is_complex() or previous_indices.is_quantized:
+                raise ValueError("previous QAT indices must use an integer tensor dtype")
+            previous = previous_indices.detach().to(
+                device=state.indices.device, dtype=torch.int64)
+            if tuple(previous.shape) != tuple(state.indices.shape):
+                raise ValueError("previous QAT index shape mismatch")
+            if previous.numel() and (int(previous.min()) < 0
+                                     or int(previous.max()) >= self.decoded_table.shape[0]
+                                     or torch.any(~self.legal_mask[previous])):
+                raise ValueError("previous QAT indices contain an illegal codeword")
+            previous_counts = torch.bincount(
+                previous.flatten(), minlength=self.decoded_table.shape[0])
+            index_flip_count = int((state.indices != previous).sum())
+            newly_activated = int(((counts > 0) & (previous_counts == 0)
+                                   & self.legal_mask).sum())
+            retired = int(((counts == 0) & (previous_counts > 0)
+                           & self.legal_mask).sum())
+        lane_fractions = []
+        for lane in range(8):
+            values = hard_words[..., lane]
+            lane_fractions.append({
+                "negative": float((values == -1).float().mean()),
+                "zero": float((values == 0).float().mean()),
+                "positive": float((values == 1).float().mean()),
+            })
+        tiny = torch.finfo(self.scale_dtype).tiny
         metrics = {
-            "index_flip_rate": (0.0 if previous_indices is None else
-                                float((state.indices.cpu() != previous_indices.cpu()).float().mean())),
-            "margin_p05": float(torch.quantile(
-                (state.second_distance - state.best_distance).float().flatten(), 0.05)),
+            "phase": self.phase,
+            "group_count": state.indices.numel(),
+            "weight_count": self.latent_weight.numel(),
+            "index_flip_count": index_flip_count,
+            "index_flip_rate": index_flip_count / max(state.indices.numel(), 1),
+            "frozen_assignment_disagreement_rate": (
+                float((diagnostic_state.indices != state.indices).float().mean())
+                if self.phase == "frozen" else 0.0),
+            "mean_changed_trits_per_group": float(changed.float().mean()),
+            "changed_trits_histogram": {
+                str(value): int((changed == value).sum()) for value in range(9)
+            },
+            "scalar_pattern_exact_hit_rate": float((changed == 0).float().mean()),
+            "margin_min": float(margin.min()),
+            "margin_mean": float(margin.mean()),
+            "margin_p05": float(torch.quantile(margin, 0.05)),
+            "margin_p50": float(torch.quantile(margin, 0.50)),
+            "margin_p95": float(torch.quantile(margin, 0.95)),
             "codebook_entropy": float(-(probabilities * probabilities.log2()).sum()),
             "codebook_perplexity": float(torch.exp(-(probabilities * probabilities.log()).sum())),
-            "dead_codewords": float((counts[self.legal_mask] == 0).sum()),
+            "dead_codewords": int((counts[self.legal_mask] == 0).sum()),
+            "newly_activated_codewords": newly_activated,
+            "retired_codewords": retired,
             "zero_codeword_rate": float((hard_words == 0).all(-1).float().mean()),
             "frac_neg": float((hard_words == -1).float().mean()),
             "frac_zero": float((hard_words == 0).float().mean()),
             "frac_pos": float((hard_words == 1).float().mean()),
+            "lane_trit_fractions": lane_fractions,
+            "source_scale_min": float(source_alpha.min()),
+            "source_scale_median": float(source_alpha.median()),
+            "source_scale_max": float(source_alpha.max()),
             "scale_min": float(alpha.min()),
             "scale_median": float(alpha.median()),
             "scale_max": float(alpha.max()),
+            "scale_underflow_count": int(
+                ((~self.zero_rows) & (source_alpha < tiny)).sum()),
+            "weighted_projection_error": weighted_error,
+            "weighted_source_energy": weighted_source,
+            "weighted_projection_relative_error": math.sqrt(
+                weighted_error / max(weighted_source, 1e-30)),
         }
         return metrics
 
@@ -347,8 +518,37 @@ class TQ1Linear(nn.Module):
         payload = pack_payload(state.indices.cpu(), self.profile)
         return payload, alpha.to(self.scale_dtype).cpu()
 
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        immutable = (
+            "zero_rows", "decoded_table", "legal_mask", "candidate_indices",
+            "importance_diag", "importance_cov8",
+        )
+        for name in immutable:
+            expected = getattr(self, name)
+            key = prefix + name
+            if expected is None:
+                if key in state_dict:
+                    error_msgs.append(f"{key}: unexpected immutable QAT buffer")
+                continue
+            if key in state_dict:
+                observed = state_dict[key]
+                if observed.dtype != expected.dtype \
+                        or tuple(observed.shape) != tuple(expected.shape) \
+                        or not torch.equal(observed.detach().cpu(), expected.detach().cpu()):
+                    error_msgs.append(
+                        f"{key}: immutable QAT buffer differs from canonical initialization")
+        for name in ("indices", "frozen_reference"):
+            key = prefix + name
+            if key in state_dict and state_dict[key].dtype != torch.int64:
+                error_msgs.append(f"{key}: serialized QAT indices must be int64")
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+
     def get_extra_state(self) -> torch.Tensor:
         state = {
+            "schema": 1,
             "profile": self.profile,
             "phase": self.phase,
             "temperature": self.temperature,
@@ -358,27 +558,171 @@ class TQ1Linear(nn.Module):
             "codebook_id": self.codebook_id,
             "codebook_sha256": self.codebook_sha256,
             "codebook_encoding": self.codebook_encoding,
+            "assignment_mode": self.assignment_mode,
+            "weight_metric": self.weight_metric,
+            "importance_mode": self.importance_mode,
         }
         payload = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return torch.tensor(list(payload), dtype=torch.uint8)
 
     def set_extra_state(self, state: torch.Tensor | dict[str, Any]) -> None:
-        # Dict support reads early development checkpoints; new checkpoints are
-        # safetensors-compatible uint8 canonical JSON.
+        # New checkpoints use a safetensors-compatible uint8 canonical JSON
+        # vector. Dict input remains useful to PyTorch callers but obeys the
+        # same explicit schema.
         if isinstance(state, torch.Tensor):
             if state.dtype != torch.uint8 or state.ndim != 1:
                 raise ValueError("TQ1 extra state must be a uint8 JSON vector")
-            state = json.loads(bytes(state.cpu().tolist()).decode("utf-8"))
+            try:
+                state = json.loads(bytes(state.cpu().tolist()).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("TQ1 extra state is not canonical JSON") from exc
+        required = {
+            "schema", "profile", "phase", "temperature", "top_m",
+            "quant_spec_json", "quant_spec_sha256", "codebook_id",
+            "codebook_sha256", "codebook_encoding", "assignment_mode",
+            "weight_metric", "importance_mode",
+        }
+        if not isinstance(state, dict) or set(state) != required or state["schema"] != 1:
+            raise ValueError("TQ1 extra state has an unsupported schema")
         if state["quant_spec_sha256"] != self.quant_spec_sha256:
             raise ValueError("QAT checkpoint QuantSpec mismatch")
+        if state["quant_spec_json"] != self.quant_spec_json:
+            raise ValueError("QAT checkpoint canonical QuantSpec JSON mismatch")
         if state["codebook_sha256"] != self.codebook_sha256:
             raise ValueError("QAT checkpoint codebook mismatch")
+        if state["codebook_id"] != self.codebook_id \
+                or state["codebook_encoding"] != self.codebook_encoding:
+            raise ValueError("QAT checkpoint codebook identity mismatch")
         if state["profile"] != self.profile:
             raise ValueError("QAT checkpoint tensor profile mismatch")
-        self.top_m = int(state["top_m"])
-        self.temperature_value.fill_(float(state["temperature"]))
-        self.phase_code.fill_(_PHASES[state["phase"]])
+        for name in ("assignment_mode", "weight_metric", "importance_mode"):
+            if state.get(name, getattr(self, name)) != getattr(self, name):
+                raise ValueError(f"QAT checkpoint {name} mismatch")
+        top_m = state["top_m"]
+        temperature = state["temperature"]
+        phase = state["phase"]
+        if isinstance(top_m, bool) or not isinstance(top_m, int) \
+                or top_m < 1 or top_m != self.top_m:
+            raise ValueError("QAT checkpoint top_m differs from canonical initialization")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+                or not math.isfinite(float(temperature)) or float(temperature) <= 0:
+            raise ValueError("QAT checkpoint temperature is invalid")
+        if phase not in _PHASES:
+            raise ValueError("QAT checkpoint phase is invalid")
+        if self.phase != phase or self.temperature != float(temperature):
+            raise ValueError("QAT checkpoint duplicated phase/temperature state disagrees")
+        if phase == "frozen":
+            if tuple(self.frozen_reference.shape) != tuple(self.indices.shape) \
+                    or not torch.equal(self.frozen_reference, self.indices):
+                raise ValueError("QAT checkpoint frozen indices are inconsistent")
+        elif self.frozen_reference.numel() != 0:
+            raise ValueError("non-frozen QAT checkpoint carries a frozen reference")
+        self.top_m = top_m
+        self.temperature_value.fill_(float(temperature))
+        self.phase_code.fill_(_PHASES[phase])
         self.latent_weight.requires_grad_(state["phase"] != "frozen")
+
+
+def aggregate_qat_health(tensors: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Reconcile per-tensor QAT health into one group-weighted model summary."""
+    if not tensors:
+        raise ValueError("QAT health aggregation requires at least one tensor")
+    required = {
+        "phase", "group_count", "weight_count", "index_flip_count",
+        "frozen_assignment_disagreement_rate", "changed_trits_histogram",
+        "margin_min", "margin_p05", "margin_p50", "margin_p95",
+        "codebook_entropy", "codebook_perplexity", "dead_codewords",
+        "newly_activated_codewords", "retired_codewords", "zero_codeword_rate",
+        "frac_neg", "frac_zero", "frac_pos", "lane_trit_fractions",
+        "source_scale_min", "source_scale_median", "source_scale_max",
+        "scale_min", "scale_median", "scale_max", "scale_underflow_count",
+        "weighted_projection_error", "weighted_source_energy",
+    }
+    for name, metrics in tensors.items():
+        missing = required - set(metrics)
+        if missing:
+            raise ValueError(f"{name}: QAT health is missing {sorted(missing)}")
+        if not isinstance(metrics["group_count"], int) or metrics["group_count"] < 1:
+            raise ValueError(f"{name}: QAT health group count is invalid")
+        histogram = metrics["changed_trits_histogram"]
+        if not isinstance(histogram, Mapping) or set(histogram) != {
+                str(value) for value in range(9)} \
+                or sum(int(value) for value in histogram.values()) != metrics["group_count"]:
+            raise ValueError(f"{name}: changed-trit histogram does not reconcile")
+        lanes = metrics["lane_trit_fractions"]
+        if not isinstance(lanes, list) or len(lanes) != 8:
+            raise ValueError(f"{name}: lane-trit inventory is invalid")
+    total_groups = sum(int(value["group_count"]) for value in tensors.values())
+
+    def weighted(key: str) -> float:
+        return sum(float(value[key]) * int(value["group_count"])
+                   for value in tensors.values()) / total_groups
+
+    histogram = {
+        str(changed): sum(int(value["changed_trits_histogram"][str(changed)])
+                          for value in tensors.values())
+        for changed in range(9)
+    }
+    lane_fractions = []
+    for lane in range(8):
+        lane_fractions.append({
+            trit: sum(float(value["lane_trit_fractions"][lane][trit])
+                      * int(value["group_count"])
+                      for value in tensors.values()) / total_groups
+            for trit in ("negative", "zero", "positive")
+        })
+    weighted_error = sum(float(value["weighted_projection_error"])
+                         for value in tensors.values())
+    weighted_source = sum(float(value["weighted_source_energy"])
+                          for value in tensors.values())
+    index_flips = sum(int(value["index_flip_count"]) for value in tensors.values())
+    return {
+        "tensor_count": len(tensors),
+        "group_count": total_groups,
+        "weight_count": sum(int(value["weight_count"]) for value in tensors.values()),
+        "phases": sorted({str(value["phase"]) for value in tensors.values()}),
+        "index_flip_count": index_flips,
+        "index_flip_rate": index_flips / total_groups,
+        "frozen_assignment_disagreement_rate": weighted(
+            "frozen_assignment_disagreement_rate"),
+        "mean_changed_trits_per_group": sum(
+            changed * histogram[str(changed)] for changed in range(9)) / total_groups,
+        "changed_trits_histogram": histogram,
+        "scalar_pattern_exact_hit_rate": histogram["0"] / total_groups,
+        "margin_min": min(float(value["margin_min"]) for value in tensors.values()),
+        # The aggregate p05 is deliberately conservative across tensors; p50/p95
+        # are explicitly group-weighted summaries of per-tensor quantiles.
+        "margin_p05": min(float(value["margin_p05"]) for value in tensors.values()),
+        "margin_p50_tensor_weighted": weighted("margin_p50"),
+        "margin_p95_tensor_weighted": weighted("margin_p95"),
+        "codebook_entropy_tensor_weighted": weighted("codebook_entropy"),
+        "codebook_perplexity_tensor_weighted": weighted("codebook_perplexity"),
+        "dead_codewords": sum(int(value["dead_codewords"])
+                              for value in tensors.values()),
+        "newly_activated_codewords": sum(int(value["newly_activated_codewords"])
+                                         for value in tensors.values()),
+        "retired_codewords": sum(int(value["retired_codewords"])
+                                 for value in tensors.values()),
+        "zero_codeword_rate": weighted("zero_codeword_rate"),
+        "frac_neg": weighted("frac_neg"),
+        "frac_zero": weighted("frac_zero"),
+        "frac_pos": weighted("frac_pos"),
+        "lane_trit_fractions": lane_fractions,
+        "source_scale_min": min(float(value["source_scale_min"])
+                                for value in tensors.values()),
+        "source_scale_median_tensor_weighted": weighted("source_scale_median"),
+        "source_scale_max": max(float(value["source_scale_max"])
+                                for value in tensors.values()),
+        "scale_min": min(float(value["scale_min"]) for value in tensors.values()),
+        "scale_median_tensor_weighted": weighted("scale_median"),
+        "scale_max": max(float(value["scale_max"]) for value in tensors.values()),
+        "scale_underflow_count": sum(int(value["scale_underflow_count"])
+                                     for value in tensors.values()),
+        "weighted_projection_error": weighted_error,
+        "weighted_source_energy": weighted_source,
+        "weighted_projection_relative_error": math.sqrt(
+            weighted_error / max(weighted_source, 1e-30)),
+    }
 
 
 class TQ1Embedding(TQ1Linear):

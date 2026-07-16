@@ -15,13 +15,16 @@ import torch
 import yaml
 
 from .artifact import ArtifactReader
+from .calibration import file_sha256
 from .codebook import CodebookRegistry, load_iq1_reference, sign_canonical_codebook
+from .codebook_study import load_pattern_corpus
+from .evaluation import canonical_document_sha256
 from .pipeline import (
     LLAMA_KEEP_FP_REGEXES, LLAMA_SHARED_EMBEDDING_REGEX, LLAMA_TARGET_REGEXES,
     bake_debug_checkpoint,
     classify_model_linears, collect_statistics, learn_model_codebook,
     load_statistics, run_full_model_ptq, save_model_source_files)
-from .solver import PatternCorpus, build_joint_codebook, build_product_codebook, canonical_shapes
+from .solver import build_joint_codebook, build_product_codebook, canonical_shapes
 from .spec import QuantSpec
 
 DEFAULT_MODEL = "unsloth/Llama-3.2-1B-Instruct"
@@ -126,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codebook-id", default=None)
     parser.add_argument("--codebook-artifact", default=None,
                         help="schema-2 artifact carrying the exact codebook registry")
+    parser.add_argument("--codebook-corpus", default=None,
+                        help="construction-role sensitivity corpus for a universal table")
     parser.add_argument("--codebook-weighting", default="family_equal",
                         choices=["parameter", "tensor_equal", "family_equal"])
     parser.add_argument("--codebook-lambda-nz", type=float, default=0.0)
@@ -163,6 +168,26 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     if not args.output:
         parser.error("--output is required (directly or through --config)")
     return args
+
+
+def _validate_arguments(args: argparse.Namespace) -> None:
+    if args.spec:
+        if not args.codebook_artifact:
+            raise ValueError("--spec requires --codebook-artifact")
+        if args.codebook_corpus:
+            raise ValueError("--codebook-corpus cannot be combined with --spec")
+        return
+    if args.codebook_source == "artifact" and not args.codebook_artifact:
+        raise ValueError("--codebook-source artifact requires --codebook-artifact")
+    if args.codebook_source == "iq1" and args.profile != "tq1_v11-i-r":
+        raise ValueError("IQ1 source requires --profile tq1_v11-i-r")
+    if _encoding(args.profile) == "direct_joint" \
+            and args.codebook_source not in {"iq1", "artifact"}:
+        raise ValueError("direct-joint profiles require --codebook-source iq1 or artifact")
+    if args.codebook_source == "universal" and not args.codebook_corpus:
+        raise ValueError("--codebook-source universal requires --codebook-corpus")
+    if args.codebook_corpus and args.codebook_source != "universal":
+        raise ValueError("--codebook-corpus is only legal for a universal codebook")
 
 
 def _encoding(profile: str) -> str:
@@ -226,8 +251,46 @@ def _load_model(args, revision: str):
     return model, tokenizer
 
 
+def _prepare_statistics(args, model, tokenizer, inventory, spec: QuantSpec,
+                        output: Path, revision: str, *,
+                        statistics_path: str | None = None):
+    path = statistics_path or args.statistics_artifact
+    if path is None and spec.importance_mode != "uniform":
+        if not args.calibration_file:
+            raise ValueError(
+                f"{spec.importance_mode} importance requires --statistics-artifact "
+                "or --calibration-file")
+        path = args.statistics_output or str(output) + ".calibration.safetensors"
+        modes = ["diagonal"]
+        if spec.importance_mode == "covariance8":
+            modes.append("covariance8")
+        elif spec.importance_mode == "block256":
+            modes.append("block256")
+        device = _device(args.device)
+        model.to(device)
+        collect_statistics(
+            model, tokenizer, inventory, calibration_file=args.calibration_file,
+            output=path, modes=modes,
+            sample_count=args.calibration_samples,
+            sequence_cap=args.calibration_seq_len, device=device,
+            metadata={
+                "model": args.model, "model_revision": revision,
+                "tokenizer": args.model, "tokenizer_revision": revision,
+            }, ridge_factor=args.ridge_factor)
+        model.to("cpu")
+        if device.type == "mps":
+            torch.mps.empty_cache()
+    statistics, metadata, digest = load_statistics(path, spec)
+    expected = set(inventory.statistics_targets())
+    recorded = set(metadata.get("target_modules", expected))
+    if path and recorded != expected:
+        raise ValueError("calibration artifact target inventory differs from the model")
+    return path, statistics, metadata, digest
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    _validate_arguments(args)
     output = Path(args.output).expanduser().resolve()
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"refusing to overwrite {output}")
@@ -235,11 +298,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.model, args.revision, local_files_only=args.local_files_only)
     print(f"[source] {args.model}@{revision}")
     model, tokenizer = _load_model(args, revision)
+    prepared_statistics = None
 
     if args.spec:
         spec = QuantSpec.from_dict(json.loads(Path(args.spec).read_text()))
-        if not args.codebook_artifact:
-            raise ValueError("--spec requires --codebook-artifact")
         registry = _load_artifact_registry(args.codebook_artifact)
         registry.validate_refs(spec.codebooks)
     else:
@@ -247,8 +309,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         # temporary structurally valid spec and replace it once the final table
         # hash is known.
         if args.codebook_source == "artifact":
-            if not args.codebook_artifact:
-                raise ValueError("--codebook-source artifact requires --codebook-artifact")
             registry = _load_artifact_registry(args.codebook_artifact)
             codebook_id = args.codebook_id or next(iter(book.id for book in registry.refs()))
             book = registry[codebook_id]
@@ -256,8 +316,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError("loaded codebook is incompatible with --profile")
             registry = CodebookRegistry({book.id: book})
         elif args.codebook_source == "iq1":
-            if args.profile != "tq1_v11-i-r":
-                raise ValueError("IQ1 source requires --profile tq1_v11-i-r")
             book = load_iq1_reference(
                 args.codebook_id or "iq1s_grid",
                 reference_dir=args.iq1_reference_dir)
@@ -275,7 +333,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                        args.target_regex or LLAMA_TARGET_REGEXES)
                                    else ())),
                 keep_fp_regexes=tuple(args.keep_fp_regex or LLAMA_KEEP_FP_REGEXES),
-                activation_mode=args.activation_mode, importance_mode="uniform")
+                activation_mode=args.activation_mode,
+                importance_mode=args.importance_mode)
             temporary = replace(
                 temporary,
                 shared_embedding_head=args.quantize_tied_embedding_head,
@@ -283,18 +342,74 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shared_embedding_importance=args.shared_embedding_importance)
             inventory = classify_model_linears(model, temporary)
             if args.codebook_source == "universal":
+                construction_corpus, corpus_metadata = load_pattern_corpus(
+                    args.codebook_corpus)
+                if corpus_metadata.get("role") != "construction":
+                    raise ValueError("universal codebook corpus must have role=construction")
+                if args.codebook_weighting != "family_equal" \
+                        or corpus_metadata.get("normalize_each") is not True \
+                        or corpus_metadata.get("source_weightings") != ["parameter"]:
+                    raise ValueError(
+                        "format-v1 universal construction requires parameter weighting "
+                        "within each family and a family-equal (--normalize-each) merge")
+                source_models = corpus_metadata.get("source_model_identities")
+                split_manifest_sha256 = corpus_metadata.get("split_manifest_sha256")
+                codebook_importance_mode = corpus_metadata.get("sensitivity_metric")
+                if codebook_importance_mode not in {"diagonal", "covariance8"}:
+                    raise ValueError(
+                        "universal construction corpus lacks a sensitivity metric")
+                if not isinstance(source_models, list) or not source_models:
+                    raise ValueError("universal construction corpus lacks source model identities")
+                if any(not isinstance(item, dict)
+                       or set(item) != {"model_id", "revision", "family"}
+                       or not isinstance(item["model_id"], str) or not item["model_id"]
+                       or not isinstance(item["family"], str) or not item["family"]
+                       or not isinstance(item["revision"], str)
+                       or _COMMIT_RE.fullmatch(item["revision"]) is None
+                       for item in source_models):
+                    raise ValueError("universal construction source identities are invalid")
+                source_keys = [(item["model_id"], item["revision"])
+                               for item in source_models]
+                if len(source_keys) != len(set(source_keys)):
+                    raise ValueError("universal construction source identities are duplicated")
+                if not isinstance(split_manifest_sha256, str) \
+                        or _COMMIT_RE.fullmatch(split_manifest_sha256) is None \
+                        or len(split_manifest_sha256) != 64:
+                    raise ValueError("universal construction corpus lacks a split SHA-256")
                 if _encoding(args.profile) == "product":
                     book = build_product_codebook(
                         args.codebook_id or f"universal_{_format(args.profile)}p",
-                        _format(args.profile), PatternCorpus(torch.ones(6561)),
+                        _format(args.profile), construction_corpus,
                         scope="universal", swap_limit=args.codebook_swap_limit)
                 else:
                     book = build_joint_codebook(
                         args.codebook_id or f"universal_{_format(args.profile)}j",
-                        _format(args.profile), PatternCorpus(torch.ones(6561)),
+                        _format(args.profile), construction_corpus,
                         scope="universal", lambda_nz=args.codebook_lambda_nz,
                         swap_limit=args.codebook_swap_limit)
+                solver_config = {
+                    "encoding": _encoding(args.profile),
+                    "index_format": _format(args.profile),
+                    "lambda_nz": args.codebook_lambda_nz,
+                    "swap_limit": args.codebook_swap_limit,
+                    "importance_mode": codebook_importance_mode,
+                }
+                book = replace(book, provenance={
+                    **book.provenance,
+                    "source": "construction_pattern_corpus",
+                    "pattern_corpus_sha256": file_sha256(args.codebook_corpus),
+                    "pattern_corpus_metadata_sha256": canonical_document_sha256(
+                        corpus_metadata),
+                    "solver_config_sha256": canonical_document_sha256(solver_config),
+                    "solver_config": solver_config,
+                    "source_models": source_models,
+                    "split_manifest_sha256": split_manifest_sha256,
+                    "weighting": "family_equal",
+                    "importance_mode": codebook_importance_mode,
+                })
             else:
+                prepared_statistics = _prepare_statistics(
+                    args, model, tokenizer, inventory, temporary, output, revision)
                 book = learn_model_codebook(
                     model, inventory,
                     codebook_id=args.codebook_id or f"llama32_{_format(args.profile)}"
@@ -302,44 +417,45 @@ def main(argv: Sequence[str] | None = None) -> int:
                     index_format=_format(args.profile), encoding=_encoding(args.profile),
                     weighting=args.codebook_weighting,
                     lambda_nz=args.codebook_lambda_nz,
-                    swap_limit=args.codebook_swap_limit)
+                    swap_limit=args.codebook_swap_limit,
+                    statistics=prepared_statistics[1],
+                    importance_mode=args.importance_mode)
+                solver_config = {
+                    "encoding": _encoding(args.profile),
+                    "index_format": _format(args.profile),
+                    "weighting": args.codebook_weighting,
+                    "importance_mode": (
+                        "diagonal" if args.importance_mode == "block256"
+                        else args.importance_mode),
+                    "lambda_nz": args.codebook_lambda_nz,
+                    "swap_limit": args.codebook_swap_limit,
+                }
+                book = replace(book, provenance={
+                    **book.provenance,
+                    "source": "model",
+                    "source_model": args.model,
+                    "source_revision": revision,
+                    "calibration_statistics_sha256": prepared_statistics[3],
+                    "calibration_metadata_sha256": (
+                        canonical_document_sha256(prepared_statistics[2])
+                        if prepared_statistics[2] else None),
+                    "solver_config_sha256": canonical_document_sha256(solver_config),
+                    "solver_config": solver_config,
+                })
             registry = CodebookRegistry({book.id: book})
         spec = _build_spec(args, book)
 
     inventory = classify_model_linears(model, spec)
     print(f"[inventory] {len(inventory.target)} TQ1 linears, "
           f"{len(inventory.shared_tied)} shared tensors, {len(inventory.keep_fp)} FP linears")
-    statistics_path = args.statistics_artifact
-    if statistics_path is None and spec.importance_mode != "uniform":
-        if not args.calibration_file:
-            raise ValueError(
-                f"{spec.importance_mode} importance requires --statistics-artifact "
-                "or --calibration-file")
-        statistics_path = args.statistics_output or str(output) + ".calibration.safetensors"
-        modes = ["diagonal"]
-        if spec.importance_mode == "covariance8":
-            modes.append("covariance8")
-        elif spec.importance_mode == "block256":
-            modes.append("block256")
-        device = _device(args.device)
-        model.to(device)
-        collect_statistics(
-            model, tokenizer, inventory, calibration_file=args.calibration_file,
-            output=statistics_path, modes=modes,
-            sample_count=args.calibration_samples,
-            sequence_cap=args.calibration_seq_len, device=device,
-            metadata={
-                "model": args.model, "model_revision": revision,
-                "tokenizer": args.model, "tokenizer_revision": revision,
-            }, ridge_factor=args.ridge_factor)
-        model.to("cpu")
-        if device.type == "mps":
-            torch.mps.empty_cache()
-    statistics, statistics_meta, statistics_hash = load_statistics(statistics_path, spec)
-    expected_stats = set(inventory.statistics_targets())
-    recorded_stats = set(statistics_meta.get("target_modules", expected_stats))
-    if statistics_path and recorded_stats != expected_stats:
-        raise ValueError("calibration artifact target inventory differs from the model")
+    if prepared_statistics is None:
+        prepared_statistics = _prepare_statistics(
+            args, model, tokenizer, inventory, spec, output, revision)
+    statistics_path, statistics, statistics_meta, statistics_hash = prepared_statistics
+    if statistics_path and set(statistics_meta.get(
+            "target_modules", inventory.statistics_targets())) \
+            != set(inventory.statistics_targets()):
+        raise ValueError("prepared calibration inventory differs from final QuantSpec")
     evaluation = (json.loads(Path(args.evaluation_report).read_text())
                   if args.evaluation_report else None)
     with tempfile.TemporaryDirectory(prefix="tq1-source-") as temporary:

@@ -14,7 +14,7 @@ the plans mandate from step 0:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any, Iterator, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -291,7 +291,9 @@ def code_flip_rates(prev: dict[str, torch.Tensor],
 
 
 @torch.no_grad()
-def ternary_health(model: nn.Module) -> dict[str, dict[str, float]]:
+def ternary_health(model: nn.Module,
+                   previous_codes: Mapping[str, torch.Tensor] | None = None) \
+        -> dict[str, dict[str, Any]]:
     """Per-BitLinear {-1,0,+1} code fractions, absmean scale, latent norm, and
     relative quantization error (train_plan §10.2 / moe_train_plan §6.2 panel)."""
     out = {}
@@ -331,8 +333,10 @@ def ternary_health(model: nn.Module) -> dict[str, dict[str, float]]:
     try:
         from bitnet_train.tq1.qat import iter_tq1linears
         for name, mod in iter_tq1linears(model):
-            metrics = mod.health()
+            previous = None if previous_codes is None else previous_codes.get(name)
+            metrics = mod.health(previous)
             out[name] = {
+                **metrics,
                 "frac_neg": metrics["frac_neg"],
                 "frac_zero": metrics["frac_zero"],
                 "frac_pos": metrics["frac_pos"],
@@ -341,10 +345,6 @@ def ternary_health(model: nn.Module) -> dict[str, dict[str, float]]:
                 "quant_rel_err": float((mod.projected_weight().detach().float()
                                         - mod.weight.detach().float()).norm())
                                   / max(float(mod.weight.detach().float().norm()), 1e-20),
-                "index_flip_rate": metrics["index_flip_rate"],
-                "margin_p05": metrics["margin_p05"],
-                "codebook_entropy": metrics["codebook_entropy"],
-                "dead_codewords": metrics["dead_codewords"],
             }
     except ImportError:  # pragma: no cover
         pass

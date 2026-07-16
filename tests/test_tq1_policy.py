@@ -71,3 +71,22 @@ def test_family_moves_are_atomic_and_policy_materializes_exact_rules():
         "model.layers.0.self_attn.q_proj") == ("tq1_v12-j-r", "v12")
     assert materialized.resolve_profile(
         "model.layers.1.self_attn.q_proj") == ("bf16", None)
+
+
+def test_trial_cap_never_selects_from_a_partial_greedy_frontier():
+    tensors = [PolicyTensor("a", (8, 256)), PolicyTensor("b", (8, 256))]
+    start = {tensor.name: "tq1_v11-j-r" for tensor in tensors}
+    calls = []
+
+    def evaluate(policy):
+        calls.append(dict(policy))
+        return float(sum(profile == "tq1_v11-j-r" for profile in policy.values()))
+
+    result = greedy_policy_search(
+        tensors, start, {"tq1_v11-j-r": ("tq1_v12-j-r",)},
+        byte_budget=sum(tensor.bytes_for("tq1_v12-j-r") for tensor in tensors),
+        evaluator=evaluate, policy_split_sha256="d" * 64, max_trials=1)
+    assert result.policy == start
+    assert len(calls) == 1  # immutable baseline only; the two-move frontier is untouched
+    assert len(result.trials) == 1
+    assert result.termination_reason == "trial_budget_before_complete_frontier"

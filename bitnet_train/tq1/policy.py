@@ -43,6 +43,7 @@ class PolicySearchResult:
     objective: float
     total_bytes: int
     trials: tuple[dict, ...]
+    termination_reason: str
 
 
 def greedy_policy_search(tensors: Sequence[PolicyTensor], starting_policy: Mapping[str, str],
@@ -83,8 +84,9 @@ def greedy_policy_search(tensors: Sequence[PolicyTensor], starting_policy: Mappi
             canonical_json(policy).encode()).hexdigest(),
     }]
     trial_id = 1
+    termination_reason = "no_legal_moves"
     while trial_id <= max_trials:
-        candidates = []
+        frontier = []
         for group_name, names in sorted(groups.items()):
             before_profiles = {policy[name] for name in names}
             if len(before_profiles) != 1:
@@ -100,38 +102,48 @@ def greedy_policy_search(tensors: Sequence[PolicyTensor], starting_policy: Mappi
                     raise ValueError(f"promotion {before}->{after} is not byte-increasing")
                 if candidate_bytes > byte_budget:
                     continue
-                objective = float(evaluator(candidate))
-                if not math.isfinite(objective):
-                    raise ValueError("policy evaluator returned a nonfinite objective")
-                improvement = current_objective - objective
-                record = {
-                    "trial": trial_id, "move": {
-                        "group": group_name, "tensors": list(names),
-                        "from": before, "to": after},
-                    "objective": objective, "total_bytes": candidate_bytes,
-                    "byte_delta": delta, "improvement": improvement,
-                    "improvement_per_byte": improvement / delta,
-                    "accepted": False, "policy_split_sha256": policy_split_sha256,
-                    "policy_sha256": __import__("hashlib").sha256(
-                        canonical_json(candidate).encode()).hexdigest(),
-                }
-                trials.append(record); trial_id += 1
-                if improvement > 0:
-                    canonical_policy = tuple(sorted(candidate.items()))
-                    candidates.append((-(improvement / delta), candidate_bytes,
-                                       canonical_policy, objective, record, candidate))
-                if trial_id > max_trials:
-                    break
-            if trial_id > max_trials:
-                break
+                frontier.append((group_name, names, before, after, candidate,
+                                 candidate_bytes, delta))
+        if not frontier:
+            termination_reason = "no_legal_moves_within_budget"
+            break
+        if len(frontier) > max_trials - trial_id + 1:
+            termination_reason = "trial_budget_before_complete_frontier"
+            break
+        candidates = []
+        for group_name, names, before, after, candidate, candidate_bytes, delta in frontier:
+            objective = float(evaluator(candidate))
+            if not math.isfinite(objective):
+                raise ValueError("policy evaluator returned a nonfinite objective")
+            improvement = current_objective - objective
+            record = {
+                "trial": trial_id, "move": {
+                    "group": group_name, "tensors": list(names),
+                    "from": before, "to": after},
+                "objective": objective, "total_bytes": candidate_bytes,
+                "byte_delta": delta, "improvement": improvement,
+                "improvement_per_byte": improvement / delta,
+                "accepted": False, "policy_split_sha256": policy_split_sha256,
+                "policy_sha256": __import__("hashlib").sha256(
+                    canonical_json(candidate).encode()).hexdigest(),
+            }
+            trials.append(record); trial_id += 1
+            if improvement > 0:
+                canonical_policy = tuple(sorted(candidate.items()))
+                candidates.append((-(improvement / delta), candidate_bytes,
+                                   canonical_policy, objective, record, candidate))
         if not candidates:
+            termination_reason = "no_improving_moves"
             break
         _, candidate_bytes, _, objective, record, candidate = min(candidates)
         record["accepted"] = True
         policy = candidate
         current_bytes = candidate_bytes
         current_objective = objective
-    return PolicySearchResult(policy, current_objective, current_bytes, tuple(trials))
+    else:
+        termination_reason = "trial_budget_exhausted"
+    return PolicySearchResult(
+        policy, current_objective, current_bytes, tuple(trials), termination_reason)
 
 
 def make_move_groups(tensors: Sequence[PolicyTensor], granularity: str) \

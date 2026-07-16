@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 
 import torch
 
@@ -6,10 +7,36 @@ from bitnet_train.tq1.artifact import ArtifactReader
 from bitnet_train.tq1.codebook import CodebookRegistry, sign_canonical_codebook
 from bitnet_train.tq1.pipeline import (
     LLAMA_KEEP_FP_REGEXES, LLAMA_TARGET_REGEXES, classify_model_linears,
-    run_full_model_ptq)
+    executable_source_hashes, repository_provenance, run_full_model_ptq)
 from bitnet_train.tq1.runtime import load_packed_model
 from bitnet_train.tq1.solver import canonical_shapes
 from bitnet_train.tq1.spec import QuantSpec, TensorRule
+
+
+def test_executable_source_hashes_cover_entrypoints_runtime_and_llama_patch():
+    hashes = executable_source_hashes()
+    required = {
+        "quant/quant.py", "quant/export_gguf.py",
+        "quant/llama_cpp/apply_and_test.py",
+        "quant/llama_cpp/patches/a582222-tq1-v.patch",
+        "quant/llama_cpp/tests/tq1_kernel_test.cpp",
+        "bitnet_train/tq1/pipeline.py", "bitnet_train/cpu/src/bitnet_cpu.c",
+        "bitnet_train/metal/kernels/bitnet/qgemm_fused.metal",
+        "bitnet_train/metal/tk_torch/torch_kernels.mm",
+        "train/train.py",
+    }
+    assert required <= set(hashes)
+    assert all(len(value) == 64 for value in hashes.values())
+
+
+def test_repository_provenance_names_compiler_device_and_seed():
+    provenance = repository_provenance()
+    assert provenance["c_compiler"]
+    assert provenance["ptq_assignment_device"] == "cpu"
+    assert provenance["torch_initial_seed"] == torch.initial_seed()
+    assert set(provenance["device_inventory"]) == {
+        "cpu", "mps_available", "cuda_available", "cuda_runtime", "cuda_devices",
+    }
 
 
 def test_full_model_ptq_emits_canonical_schema2(tmp_path):
@@ -48,6 +75,20 @@ def test_full_model_ptq_emits_canonical_schema2(tmp_path):
     assert reader.manifest["artifact_schema"] == 2
     assert len(reader.manifest["tensors"]) == 7
     assert reader.manifest["quant_spec_sha256"] == spec.sha256()
+    quantization_report = json.loads(
+        (output / "quantization_report.json").read_text(encoding="utf-8"))
+    families = quantization_report["aggregate"]["projection_families"]
+    assert set(families) == {
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    }
+    assert all(summary["target_tensors"] == 1 for summary in families.values())
+    assert sum(summary["target_parameters"] for summary in families.values()) == \
+        quantization_report["aggregate"]["target_parameters"]
+    assert {
+        report["projection_family"]
+        for report in quantization_report["tensors"].values()
+    } == set(families)
     assert (output / "config.json").is_file()
     assert reader.aliases["lm_head.weight"]["target"] == \
         "model.embed_tokens.weight"

@@ -4,6 +4,8 @@ import json
 
 import pytest
 import torch
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from bitnet_train.tq1.calibration import (
@@ -79,6 +81,19 @@ def test_statistics_match_direct_formulas_and_merge(tmp_path):
     assert left.token_count == sums.token_count
 
 
+def test_covariance_statistics_reject_zero_groups_and_invalid_ridge():
+    sums = ModuleSums(256, frozenset(("diagonal", "covariance8")))
+    value = torch.zeros(2, 256)
+    value[:, :8] = torch.randn(2, 8)
+    sums.add(value)
+    with pytest.raises(ValueError, match="zero-statistic group"):
+        normalized_statistics(sums)
+    complete = ModuleSums(256, frozenset(("diagonal",)))
+    complete.add(torch.randn(2, 256))
+    with pytest.raises(ValueError, match="ridge_factor"):
+        normalized_statistics(complete, ridge_factor=-1)
+
+
 def test_artifact_merge_uses_raw_sums_and_rejects_identity_mismatch(tmp_path):
     torch.manual_seed(31)
     x = torch.randn(9, 256)
@@ -97,6 +112,7 @@ def test_artifact_merge_uses_raw_sums_and_rejects_identity_mismatch(tmp_path):
         save_calibration_artifact(path, {"layer": sums}, metadata={
             **identity, "records": 1, "retained_tokens": len(part),
             "truncated_tokens": index, "bucket_tokens": {"unit": len(part)},
+            "source_tokens": {f"source_{index}": len(part)},
             "calibration_file_sha256": str(index) * 64,
         }, extra_tensors={"model.embed_tokens.token_frequency": frequencies})
         paths.append(path)
@@ -108,6 +124,7 @@ def test_artifact_merge_uses_raw_sums_and_rejects_identity_mismatch(tmp_path):
     torch.testing.assert_close(got["layer"].cov8_sum, expected.cov8_sum)
     assert got["layer"].token_count == 9
     assert metadata["records"] == 2 and metadata["bucket_tokens"] == {"unit": 9}
+    assert metadata["source_tokens"] == {"source_0": 4, "source_1": 5}
     assert metadata["truncated_tokens"] == 1
     tensors, _ = load_calibration_artifact(merged)
     assert torch.equal(
@@ -120,3 +137,53 @@ def test_artifact_merge_uses_raw_sums_and_rejects_identity_mismatch(tmp_path):
         **identity, "model_revision": "c" * 40})
     with pytest.raises(ValueError, match="model_revision"):
         merge_calibration_artifacts((paths[0], bad), tmp_path / "nope.safetensors")
+
+
+def test_calibration_loader_rejects_normalized_statistics_that_do_not_match_raw_sums(
+        tmp_path):
+    sums = ModuleSums(256, frozenset(("diagonal", "covariance8")))
+    sums.add(torch.randn(4, 256))
+    valid = tmp_path / "valid.safetensors"
+    save_calibration_artifact(valid, {"layer": sums}, metadata={"model": "unit"})
+    tensors = load_file(valid)
+    tensors["layer.diag"] = tensors["layer.diag"] * 2
+    with safe_open(valid, framework="pt", device="cpu") as handle:
+        metadata = handle.metadata()
+    corrupt = tmp_path / "corrupt.safetensors"
+    save_file(tensors, corrupt, metadata=metadata)
+    with pytest.raises(ValueError, match="normalized diag does not match raw sums"):
+        load_calibration_artifact(corrupt)
+
+
+def test_calibration_metadata_and_tensor_inventory_fail_closed(tmp_path):
+    sums = ModuleSums(256, frozenset(("diagonal", "covariance8")))
+    sums.add(torch.randn(4, 256))
+    with pytest.raises(ValueError, match="finite JSON"):
+        save_calibration_artifact(
+            tmp_path / "nan.safetensors", {"layer": sums},
+            metadata={"invalid": float("nan")})
+    with pytest.raises(ValueError, match="extra tensor"):
+        save_calibration_artifact(
+            tmp_path / "extra.safetensors", {"layer": sums}, metadata={},
+            extra_tensors={"undeclared": torch.ones(1)})
+
+    valid = tmp_path / "valid_metadata.safetensors"
+    save_calibration_artifact(valid, {"layer": sums}, metadata={})
+    tensors = load_file(valid)
+    with safe_open(valid, framework="pt", device="cpu") as handle:
+        transport = handle.metadata()
+    metadata = json.loads(transport["metadata_json"])
+    metadata["ridge_damping_before_normalization"]["layer"] *= 2
+    transport["metadata_json"] = json.dumps(metadata, separators=(",", ":"))
+    corrupt = tmp_path / "bad_damping.safetensors"
+    save_file(tensors, corrupt, metadata=transport)
+    with pytest.raises(ValueError, match="ridge-damping metadata"):
+        load_calibration_artifact(corrupt)
+
+    tensors["undeclared"] = torch.ones(1)
+    unknown = tmp_path / "unknown_tensor.safetensors"
+    metadata["ridge_damping_before_normalization"]["layer"] /= 2
+    transport["metadata_json"] = json.dumps(metadata, separators=(",", ":"))
+    save_file(tensors, unknown, metadata=transport)
+    with pytest.raises(ValueError, match="unknown fields"):
+        load_calibration_artifact(unknown)

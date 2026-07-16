@@ -21,6 +21,7 @@ from safetensors.torch import load_file, save_file
 
 from .codebook import Codebook, CodebookRegistry
 from .evaluation import validate_quality_report
+from .oracle import validate_scale_index_invariants
 from .packing import layout, unpack_payload
 from .spec import ARTIFACT_SCHEMA, FLOAT_PROFILES, QuantSpec, canonical_json
 
@@ -147,7 +148,9 @@ class ArtifactBuilder:
         if logical_shape[-1] % 256:
             raise ValueError("TQ1 input width must be divisible by 256")
         expected_payload = (*logical_shape[:-1], logical_shape[-1] // 256, spec.block_bytes)
-        value = payload.detach().to(torch.uint8).contiguous().cpu()
+        if payload.dtype != torch.uint8:
+            raise ValueError("TQ1 payload must already use canonical uint8 storage")
+        value = payload.detach().contiguous().cpu()
         if tuple(value.shape) != expected_payload:
             raise ValueError(f"{state_dict_name}: payload shape {tuple(value.shape)} "
                              f"does not equal {expected_payload}")
@@ -156,7 +159,7 @@ class ArtifactBuilder:
             "product" if "-p-" in profile else "sign_canonical"
         if book.index_bits != spec.index_bits or book.encoding != expected_encoding:
             raise ValueError("tensor profile is incompatible with its codebook")
-        indices, embedded_scales, _ = unpack_payload(value, profile)
+        indices, embedded_scales, affine = unpack_payload(value, profile)
         book.validate_indices(indices)
         payload_key = f"{state_dict_name}.__tq1_payload"
         scale_key = scale_hash = scale_dtype = None
@@ -176,6 +179,11 @@ class ArtifactBuilder:
             raise ValueError("block-scale payload owns its scales")
         elif not torch.isfinite(embedded_scales).all() or torch.any(embedded_scales < 0):
             raise ValueError("embedded scales must be finite and nonnegative")
+        scales = scale_value if scale_value is not None else embedded_scales
+        assert scales is not None
+        validate_scale_index_invariants(
+            indices, scales, book, block_scales=spec.scale_mode == "block256",
+            affine_nibbles=affine)
         self.packed[payload_key] = value
         if scale_key is not None and scale_value is not None:
             self.packed[scale_key] = scale_value
@@ -200,6 +208,10 @@ class ArtifactBuilder:
         if source_tensor is not None:
             if tuple(source_tensor.shape) != tuple(logical_shape):
                 raise ValueError(f"{state_dict_name}: source tensor shape mismatch")
+            if source_tensor.dtype not in {torch.float16, torch.bfloat16, torch.float32} \
+                    or not torch.isfinite(source_tensor).all():
+                raise ValueError(
+                    f"{state_dict_name}: source tensor has an unsupported dtype or value")
             source_key = self._source_key(
                 source_tensor, dtype=source_tensor.dtype, logical_kind=logical_kind)
             if source_key is None:
@@ -698,7 +710,7 @@ class ArtifactReader:
                 profile_layout = layout(item["profile"])
                 logical_shape = tuple(item["logical_shape"])
                 if item["logical_dtype"] not in {
-                        "float16", "bfloat16", "float32", "float64"}:
+                        "float16", "bfloat16", "float32"}:
                     raise ValueError(f"invalid logical dtype for {item['state_dict_name']}")
                 if item["logical_kind"] not in {"parameter", "buffer"}:
                     raise ValueError(f"invalid logical kind for {item['state_dict_name']}")
@@ -722,10 +734,22 @@ class ArtifactReader:
                         raise ValueError(f"scale shape/dtype mismatch for {item['state_dict_name']}")
                     if tensor_sha256(scale) != item["scale_sha256"]:
                         raise ValueError(f"scale hash mismatch for {item['state_dict_name']}")
-                indices, embedded, _ = unpack_payload(payload, item["profile"])
-                registry[item["codebook_id"]].validate_indices(indices)
+                    if not torch.isfinite(scale).all() or torch.any(scale < 0):
+                        raise ValueError(f"invalid row scales for {item['state_dict_name']}")
+                indices, embedded, affine = unpack_payload(payload, item["profile"])
+                book = registry[item["codebook_id"]]
+                book.validate_indices(indices)
                 if profile_layout.scale_mode == "block256" and embedded is None:
                     raise ValueError("block-scale tensor has no embedded scales")
+                if embedded is not None and (
+                        not torch.isfinite(embedded).all() or torch.any(embedded < 0)):
+                    raise ValueError(f"invalid embedded scales for {item['state_dict_name']}")
+                scales = scale if item["scale_key"] is not None else embedded
+                assert scales is not None
+                validate_scale_index_invariants(
+                    indices, scales, book,
+                    block_scales=profile_layout.scale_mode == "block256",
+                    affine_nibbles=affine)
             codebook_keys = {key for key in keys if key.startswith("__tq1_codebook.")}
             if keys != expected_tensor_keys | codebook_keys:
                 extra = keys - expected_tensor_keys - codebook_keys
@@ -742,6 +766,8 @@ class ArtifactReader:
                 raise ValueError(f"non-TQ1 shape/dtype mismatch for {name}")
             if tensor_sha256(non_tensors[name]) != meta["sha256"]:
                 raise ValueError(f"non-TQ1 hash mismatch for {name}")
+            if value.is_floating_point() and not torch.isfinite(value).all():
+                raise ValueError(f"non-TQ1 tensor is nonfinite for {name}")
             kind = meta.get("kind", "parameter")
             if kind not in {"parameter", "buffer"}:
                 raise ValueError(f"invalid non-TQ1 logical kind for {name}")

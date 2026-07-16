@@ -178,9 +178,10 @@ QI-0 is implemented in the training and schema-2 artifact paths:
 
 - `QATSchedule` and `QATController` use global-token positions exclusively.
   Training validates reachability, launch alignment, and sustained-observation
-  capacity before loading model weights. Controller schema 2, the exact gate
+  capacity before loading model weights. Controller schema 3, the exact gate
   code snapshot, and the data position are checkpointed; step-domain controller
-  checkpoints are rejected by resume and export.
+  checkpoints and schema-2 histories lacking finite KL/zero/underflow gate
+  measurements are rejected by resume and export.
 - The canonical 200M-token profile has boundaries aligned for one, two, and four
   processes. These values make the run structurally valid; they remain pilot
   inputs rather than evidence that the quality thresholds are optimal.

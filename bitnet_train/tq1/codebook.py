@@ -12,17 +12,34 @@ from typing import Mapping
 
 import torch
 
-from .spec import CodebookRef, FORMAT_VERSION
+from .spec import CodebookRef, FORMAT_VERSION, IQ1_CODEBOOK_SHA256
 
-IQ1_CODEBOOK_SHA256 = "1edfeb295366968940d5d4397dc046110f851acb59de9407fdf0c06982adaa72"
 IQ1_REFERENCE_REVISION = "a5822222909b785f23ddc74ce3c8f85bd0e38562"
 _POW3_4 = torch.tensor([1, 3, 9, 27], dtype=torch.int64)
 _POW3_8 = torch.tensor([1, 3, 9, 27, 81, 243, 729, 2187], dtype=torch.int64)
 
 
+def _require_exact_trits(trits: torch.Tensor, name: str = "trits") -> None:
+    if not isinstance(trits, torch.Tensor) or trits.dtype == torch.bool \
+            or trits.is_complex() or trits.is_quantized:
+        raise ValueError(f"{name} must contain exact -1, 0, +1 values")
+    if trits.is_floating_point() and not torch.isfinite(trits).all():
+        raise ValueError(f"{name} contains NaN or infinity")
+    if not torch.all((trits == -1) | (trits == 0) | (trits == 1)):
+        raise ValueError(f"{name} must contain exact -1, 0, +1 values")
+
+
+def _require_integer_indices(indices: torch.Tensor) -> None:
+    if not isinstance(indices, torch.Tensor) or indices.dtype == torch.bool \
+            or indices.is_floating_point() or indices.is_complex() \
+            or indices.is_quantized:
+        raise ValueError("codebook indices must use an integer tensor dtype")
+
+
 def base3_ids(trits: torch.Tensor) -> torch.Tensor:
     if trits.shape[-1] not in {4, 8}:
         raise ValueError("base-3 encoding supports four or eight lanes")
+    _require_exact_trits(trits)
     powers = _POW3_4 if trits.shape[-1] == 4 else _POW3_8
     return ((trits.to(torch.int64).cpu() + 1) * powers).sum(dim=-1)
 
@@ -41,8 +58,7 @@ def masks_to_trits(masks: torch.Tensor) -> torch.Tensor:
 def trits_to_masks(trits: torch.Tensor) -> torch.Tensor:
     if trits.ndim != 2 or trits.shape[1] != 8:
         raise ValueError("joint trits must have shape [count,8]")
-    if not torch.all((trits >= -1) & (trits <= 1)):
-        raise ValueError("codebooks may contain only -1, 0, +1")
+    _require_exact_trits(trits, "codebook trits")
     bits = (1 << torch.arange(8, dtype=torch.int64))[None]
     positive = ((trits.cpu() == 1).to(torch.int64) * bits).sum(1).to(torch.uint8)
     negative = ((trits.cpu() == -1).to(torch.int64) * bits).sum(1).to(torch.uint8)
@@ -225,6 +241,7 @@ class Codebook:
         return {members[0]: members for members in groups.values() if len(members) > 1}
 
     def validate_indices(self, indices: torch.Tensor) -> None:
+        _require_integer_indices(indices)
         values = indices.to(torch.int64).cpu()
         if values.numel() and (int(values.min()) < 0 or int(values.max()) >= self.index_count):
             raise ValueError("codebook index is outside the physical range")
@@ -234,6 +251,7 @@ class Codebook:
             raise ValueError(f"payload contains reserved indices {bad[:8]}")
 
     def decode(self, indices: torch.Tensor) -> torch.Tensor:
+        _require_integer_indices(indices)
         values = indices.to(torch.int64).cpu()
         if values.numel() and (int(values.min()) < 0 or int(values.max()) >= self.index_count):
             raise ValueError("codebook index is outside the physical range")
@@ -281,6 +299,7 @@ def sign_canonical_codebook(codebook_id: str, index_format: str,
                             shapes: torch.Tensor, *, scope: str = "model",
                             provenance: Mapping[str, object] | None = None) -> Codebook:
     """Create a J codebook while enforcing the canonical serialized row order."""
+    _require_exact_trits(shapes, "sign-canonical shapes")
     value = shapes.detach().to(torch.int8).cpu()
     count = 1024 if index_format == "v11" else 2048
     if tuple(value.shape) != (count, 8):
@@ -298,6 +317,7 @@ def sign_canonical_codebook(codebook_id: str, index_format: str,
 def direct_joint_codebook(codebook_id: str, trits: torch.Tensor, *,
                           scope: str = "iq1",
                           provenance: Mapping[str, object] | None = None) -> Codebook:
+    _require_exact_trits(trits, "direct-joint trits")
     return Codebook(codebook_id, "v11", "direct_joint", scope,
                     {"joint_trits": trits.detach().to(torch.int8).cpu()}, provenance or {})
 
@@ -344,6 +364,8 @@ def load_iq1_reference(codebook_id: str = "iq1s_grid", *,
 def product_codebook(codebook_id: str, index_format: str, product_a: torch.Tensor,
                      product_b: torch.Tensor, *, scope: str = "model",
                      provenance: Mapping[str, object] | None = None) -> Codebook:
+    _require_exact_trits(product_a, "product A trits")
+    _require_exact_trits(product_b, "product B trits")
     return Codebook(codebook_id, index_format, "product", scope, {
         "product_a": product_a.detach().to(torch.int8).cpu(),
         "product_b": product_b.detach().to(torch.int8).cpu(),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from bitnet_train.tq1.codebook import (
 )
 from bitnet_train.tq1.oracle import (
     dequantize_weight,
+    linear_w_only,
     linear_w2a8,
     quantize_activation,
 )
@@ -30,7 +32,7 @@ from bitnet_train.tq1.packing import (
     unpack_indices,
     unpack_payload,
 )
-from bitnet_train.tq1.spec import CodebookRef, QuantSpec, canonical_json
+from bitnet_train.tq1.spec import CodebookRef, QuantSpec, TensorRule, canonical_json
 
 
 def _universe(lanes: int) -> torch.Tensor:
@@ -108,6 +110,29 @@ def test_quant_spec_rejects_incompatible_codebook():
     assert book.ref().sha256 == book.sha256()
 
 
+def test_quant_spec_rejects_noncanonical_direct_joint_grid():
+    fake = CodebookRef("fake_iq1", "v11", "direct_joint", "model", "0" * 64)
+    with pytest.raises(ValueError, match="pinned IQ1 grid"):
+        QuantSpec.core(
+            default_profile="tq1_v11-i-r", codebook=fake,
+            target_regexes=("x",), keep_fp_regexes=("y",),
+        )
+
+
+def test_quant_spec_rejects_qat_or_gptq_incompatible_tensor_overrides():
+    book = _joint_book("v11")
+    spec = _spec(book)
+    with pytest.raises(ValueError, match="QAT supports only"):
+        replace(
+            spec, qat_projection="soft", tensor_overrides=(TensorRule(
+                "x", "tq1_v11-j-b", book.id),))
+    with pytest.raises(ValueError, match="GPTQ feedback"):
+        replace(
+            spec, importance_mode="block256", gptq_feedback=True,
+            tensor_overrides=(TensorRule(
+                "x", "tq1_v11-j-a4-r", book.id),))
+
+
 @pytest.mark.parametrize("profile", [
     "tq1_v11-j-r", "tq1_v12-j-r", "tq1_v11-j-b", "tq1_v12-j-b",
 ])
@@ -127,9 +152,13 @@ def test_payload_round_trip_and_physical_sizes(profile):
         assert torch.equal(got, indices)
         assert torch.equal(got_scales, scales)
         assert affine is None
+        with pytest.raises(ValueError, match="float16"):
+            pack_payload(indices, profile, block_scales=scales.float())
     else:
         payload = pack_payload(indices, profile)
     assert payload.shape[-1] == spec.block_bytes
+    with pytest.raises(ValueError, match="uint8 storage"):
+        unpack_payload(payload.float(), profile)
 
 
 def test_a4_payload_round_trip_and_reserved_mu_rejected():
@@ -143,6 +172,12 @@ def test_a4_payload_round_trip_and_reserved_mu_rejected():
     with pytest.raises(ValueError, match="reserved"):
         pack_payload(indices, "tq1_v11-j-a4-r",
                      affine_nibbles=torch.full_like(nibbles, 12))
+    with pytest.raises(ValueError, match="integer tensor dtype"):
+        pack_payload(indices.float(), "tq1_v11-j-a4-r",
+                     affine_nibbles=nibbles)
+    with pytest.raises(ValueError, match="integer tensor dtype"):
+        pack_payload(indices, "tq1_v11-j-a4-r",
+                     affine_nibbles=nibbles.float())
     assert book.legal_index_mask().sum() == 2047
 
 
@@ -156,6 +191,8 @@ def test_product_codebook_invariants_and_canonical_representatives(fmt, unique):
     book.validate_indices(torch.nonzero(legal).flatten())
     with pytest.raises(ValueError, match="reserved"):
         book.validate_indices(torch.nonzero(~legal).flatten()[:1])
+    with pytest.raises(ValueError, match="integer tensor dtype"):
+        book.validate_indices(torch.tensor([0.5]))
 
 
 def test_w2a8_oracle_matches_dequantized_reference():
@@ -171,6 +208,70 @@ def test_w2a8_oracle_matches_dequantized_reference():
     weight = dequantize_weight(payload, "tq1_v12-j-r", book, row_scales=scales)
     expected = aq.dequantize() @ weight.T
     torch.testing.assert_close(got, expected, atol=5e-6, rtol=1e-6)
+    invalid_scales = scales.clone()
+    invalid_scales[0] = torch.nan
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        linear_w2a8(x, payload, "tq1_v12-j-r", book,
+                    row_scales=invalid_scales)
+    with pytest.raises(ValueError, match="output dtype"):
+        linear_w2a8(x, payload, "tq1_v12-j-r", book,
+                    row_scales=scales, output_dtype=torch.int8)
+
+
+def test_scalar_oracle_rejects_output_dtype_overflow():
+    book = _joint_book("v12")
+    legal = torch.nonzero(book.legal_index_mask()).flatten()
+    index = legal[book.decode(legal).sum(1).argmax()]
+    indices = torch.full((1, 32), int(index), dtype=torch.int64)
+    payload = pack_payload(indices, "tq1_v12-j-r")
+    scales = torch.tensor([torch.finfo(torch.float16).max], dtype=torch.float16)
+    x = torch.ones(1, 256)
+    with pytest.raises(ValueError, match="overflows the requested dtype"):
+        linear_w2a8(
+            x, payload, "tq1_v12-j-r", book, row_scales=scales,
+            output_dtype=torch.float16)
+    with pytest.raises(ValueError, match="overflows the requested dtype"):
+        linear_w_only(
+            x, payload, "tq1_v12-j-r", book, row_scales=scales,
+            output_dtype=torch.float16)
+
+
+def test_embedded_block_scale_nan_is_rejected_by_scalar_oracle():
+    book = _joint_book("v11")
+    indices = torch.zeros((1, 32), dtype=torch.int64)
+    payload = pack_payload(
+        indices, "tq1_v11-j-b",
+        block_scales=torch.ones((1, 1), dtype=torch.float16))
+    nan_bytes = torch.tensor([torch.nan], dtype=torch.float16).view(torch.uint8)
+    payload[0, 0, :2] = nan_bytes
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        dequantize_weight(payload, "tq1_v11-j-b", book)
+
+
+def test_zero_scale_units_require_the_canonical_zero_representation():
+    book = _joint_book("v11")
+    indices = torch.zeros((1, 32), dtype=torch.int64)
+    indices[0, 0] = 1
+    row_payload = pack_payload(indices, "tq1_v11-j-r")
+    with pytest.raises(ValueError, match="zero-scale row"):
+        dequantize_weight(
+            row_payload, "tq1_v11-j-r", book,
+            row_scales=torch.zeros(1, dtype=torch.float16))
+    block_payload = pack_payload(
+        indices, "tq1_v11-j-b",
+        block_scales=torch.zeros((1, 1), dtype=torch.float16))
+    with pytest.raises(ValueError, match="zero-scale block"):
+        dequantize_weight(block_payload, "tq1_v11-j-b", book)
+
+    zero_indices = torch.zeros((1, 32), dtype=torch.int64)
+    affine = torch.zeros((1, 1, 8), dtype=torch.uint8)
+    affine[0, 0, 0] = 1
+    affine_payload = pack_payload(
+        zero_indices, "tq1_v11-j-a4-r", affine_nibbles=affine)
+    with pytest.raises(ValueError, match="nonzero A4 metadata"):
+        dequantize_weight(
+            affine_payload, "tq1_v11-j-a4-r", book,
+            row_scales=torch.zeros(1, dtype=torch.float16))
 
 
 def test_a4_with_block256_activation_matches_direct_dequantization():
